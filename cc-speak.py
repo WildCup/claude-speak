@@ -239,13 +239,16 @@ def clean_text(raw: str, skip_code: bool = True, skip_paths: bool = True,
     # Common symbols that get read literally
     text = text.replace("&amp;", " and ")
     text = text.replace("&", " and ")
-    text = text.replace("|", " or ")
+    text = text.replace("|", ". ")
     text = text.replace("@", " at ")
     text = text.replace("~", " ")
+    text = text.replace("≈", "is around")
+    text = text.replace("²", "squared")
+    text = text.replace("³", "cubed")
 
-    # Underscores in identifiers (snake_case -> "snake case")
-    # Only for words that look like identifiers (letters/digits with underscores)
-    text = re.sub(r"\b(\w+)_(\w+)\b", lambda m: m.group(0).replace("_", " ") if not m.group(0).startswith("__") else m.group(0), text)
+    # Underscores and slashes are silent (e.g. _someField -> someField, src/foo -> src foo)
+    text = text.replace("_", " ")
+    text = text.replace("/", " ")
 
     # Dots in qualified names (e.g., "item.image_url") -> spaces
     # But preserve decimal numbers, ellipsis, and abbreviations (Dr., U.S.A., etc.)
@@ -1047,10 +1050,30 @@ def main():
         print(f"--- {len(text)} chars, ~{len(text.split())} words ---", file=sys.stderr)
         sys.exit(0)
 
-    # Generate audio
-    output_path = args.output or os.path.join(tempfile.gettempdir(), "cc_speak_output.mp3")
-
     print(f"Generating speech ({args.backend}, voice: {args.voice}, volume: {args.volume}%)...", file=sys.stderr)
+
+    # Playback mode: stream chunks so the first sentence starts speaking while
+    # later chunks are still being synthesized. --output keeps the single-shot
+    # path so the result is one contiguous MP3.
+    if not args.output:
+        speech_queue = SpeechQueue(
+            backend=args.backend,
+            voice=args.voice,
+            rate=args.rate,
+            speed=args.speed,
+            skip_code=not args.keep_code,
+            skip_paths=not args.keep_paths,
+            volume=args.volume,
+        )
+        try:
+            for chunk in extract_speakable_chunks(text):
+                speech_queue.enqueue(chunk)
+            speech_queue.queue.join()
+        finally:
+            speech_queue.stop()
+        return
+
+    output_path = args.output
 
     tts_succeeded = False
     if args.backend == "edge":
@@ -1065,36 +1088,22 @@ def main():
             print(f"ERROR: OpenAI TTS failed: {e}", file=sys.stderr)
             tts_succeeded = False
 
-    # If primary TTS failed, try platform fallback
     if not tts_succeeded:
         print("INFO: Trying platform-native TTS fallback...", file=sys.stderr)
         if tts_fallback(text, volume=args.volume):
-            return  # Fallback spoke the text directly, no file to play
-        else:
-            print("ERROR: All TTS backends failed.", file=sys.stderr)
-            sys.exit(1)
+            return
+        print("ERROR: All TTS backends failed.", file=sys.stderr)
+        sys.exit(1)
 
-    # Validate the generated audio file
     if not _validate_audio_file(output_path):
         print("ERROR: Generated audio file is missing or empty.", file=sys.stderr)
-        # Try fallback
         print("INFO: Trying platform-native TTS fallback...", file=sys.stderr)
         if tts_fallback(text, volume=args.volume):
             return
-        else:
-            print("ERROR: All TTS backends failed.", file=sys.stderr)
-            sys.exit(1)
+        print("ERROR: All TTS backends failed.", file=sys.stderr)
+        sys.exit(1)
 
-    # Play or save
-    if args.output:
-        print(f"Audio saved to: {args.output}", file=sys.stderr)
-    else:
-        play_audio(output_path, volume=args.volume)
-        # Clean up temp file
-        try:
-            os.remove(output_path)
-        except OSError:
-            pass
+    print(f"Audio saved to: {args.output}", file=sys.stderr)
 
 
 if __name__ == "__main__":

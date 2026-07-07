@@ -40,8 +40,11 @@ Options:
   --no-browser         Don't auto-open browser
 
 # fire and forget
-bash -c "~/code/AI/audio/claude-speak/.venv/bin/python ~/code/AI/audio/claude-speak/claude-speak.py > /dev/null 2>&1 &"
-pgrep -f "claude-speak.py"
-pkill -f "claude-speak.py"
+bash -c "~/code/AI/audio/claude-speak/.venv/bin/python ~/code/AI/audio/claude-speak/speak_daemon.py > /dev/null 2>&1 &"
+pgrep -fa "speak_daemon.py"
+pkill -f "speak_daemon.py"
+
+~/.config/systemd/user/claude-speak.service
+systemctl --user status claude-speak
 
 
