@@ -57,13 +57,15 @@ def _normalize_path(path):
 def encode_cwd_to_dirname(cwd):
     """Encode a working directory path to Claude's project directory name.
 
-    Uses URL-safe base64 encoding for a fully reversible, unambiguous mapping.
-    Example: C:\\Projects\\MyApp -> Qzpc... (base64)
+    Claude Code replaces / and . with hyphens (-).
+    Example: /home/user/code/myproject -> -home-user-code-myproject
     """
     path = os.path.normpath(cwd)
-    encoded = base64.urlsafe_b64encode(path.encode("utf-8")).decode("ascii")
-    # Strip padding '=' which is safe since we can re-add on decode
-    return encoded.rstrip("=")
+    # Replace path separators and dots with hyphens
+    if os.name == 'nt':
+        # Windows: also replace drive colon and backslashes
+        path = path.replace('\\', '-').replace(':', '-')
+    return path.replace('/', '-').replace('.', '-')
 
 
 def decode_dirname_to_cwd(dirname):
@@ -136,15 +138,22 @@ def find_latest_jsonl_in_dir(directory):
 def find_active_jsonl_global():
     """Find the most recently modified JSONL file across ALL projects."""
     try:
-        project_dirs = [
-            os.path.join(CLAUDE_PROJECTS_DIR, d)
-            for d in os.listdir(CLAUDE_PROJECTS_DIR)
-            if os.path.isdir(os.path.join(CLAUDE_PROJECTS_DIR, d))
-        ]
-        if not project_dirs:
-            return None
-        latest_dir = max(project_dirs, key=os.path.getmtime)
-        return find_latest_jsonl_in_dir(latest_dir)
+        best_file = None
+        best_mtime = 0
+        for d in os.listdir(CLAUDE_PROJECTS_DIR):
+            dirpath = os.path.join(CLAUDE_PROJECTS_DIR, d)
+            if not os.path.isdir(dirpath):
+                continue
+            jsonl_files = glob.glob(os.path.join(dirpath, "*.jsonl"))
+            for f in jsonl_files:
+                try:
+                    mtime = os.path.getmtime(f)
+                    if mtime > best_mtime:
+                        best_mtime = mtime
+                        best_file = f
+                except OSError:
+                    continue
+        return best_file
     except (OSError, ValueError):
         return None
 
@@ -281,6 +290,7 @@ class SpeechMonitor:
         self.rate = rate
         self.debounce_ms = debounce_ms
         self.speech_queue = queue.Queue()
+        self.play_queue = queue.Queue()
         self.running = True
         # Bounded LRU dedup: OrderedDict keeps insertion order; evict oldest half at 2000
         self._spoken_ids_max = 2000
@@ -312,6 +322,9 @@ class SpeechMonitor:
         # Start speech worker
         self.speech_thread = threading.Thread(target=self._speech_worker, daemon=True)
         self.speech_thread.start()
+
+        self.playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
+        self.playback_thread.start()
 
         # Start debounce flusher
         self.debounce_thread = threading.Thread(target=self._debounce_flusher, daemon=True)
@@ -391,9 +404,11 @@ class SpeechMonitor:
                     # Check for voice override (allows runtime voice changes)
                     voice = self._get_voice() or self.voice
                     cc_speak.tts_edge(cleaned, voice, self.rate, output_path)
+
                     if os.path.exists(output_path):
-                        cc_speak.play_audio(output_path)
-                        os.remove(output_path)
+                        # Instead of starting a thread here,
+                        # just drop the path into the playback queue.
+                        self.play_queue.put(output_path)
                 except Exception:
                     logger.error("Speech worker error", exc_info=True)
 
@@ -452,6 +467,20 @@ class SpeechMonitor:
 
         # Global mode: find across all projects
         return find_active_jsonl_global()
+
+    def _playback_worker(self):
+            """Worker that plays audio files one by one."""
+            while self.running:
+                try:
+                    audio_path = self.play_queue.get(timeout=0.5)
+                    if audio_path is None: break
+
+                    cc_speak.play_audio(audio_path)
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+                    self.play_queue.task_done()
+                except queue.Empty:
+                    continue
 
     @staticmethod
     def _get_file_identity(filepath):
