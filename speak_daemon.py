@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
 speak_daemon: watch all Claude Code conversation logs and speak assistant output,
-with a Unix-socket control channel for pause / resume / stop / skip / repeat /
-per-session mute, and word-level timing streamed to the UI for live highlighting.
+with a Unix-socket control channel for per-session pause / resume / skip / stop /
+repeat, and word-level timing streamed to the UI for live highlighting.
 
 Architecture:
     watcher thread   -> discovers JSONL files, tails them, enqueues Utterances
-    synth worker     -> Utterance -> edge-tts mp3 + WordBoundary timings -> PlayItem
-    playback worker  -> PlayItem  -> ffplay (controllable: SIGSTOP/SIGCONT/kill)
+    synth worker     -> Utterance -> edge-tts mp3 + WordBoundary timings -> PlayItem,
+                        routed into the owning session's own play queue
+    scheduler thread -> plays one session at a time (the "active" session), with
+                        per-session pause (SIGSTOP/SIGCONT), skip, stop, repeat
     socket server    -> accepts UI/CLI clients, dispatches commands, broadcasts events
 
-The whole pipeline is in one process so a single audio output is shared and the
-transport controls (stop/pause/skip) act on exactly what you hear.
+Playback model (one speaker, many sessions):
+    Only one session is audible at a time (you can't listen to two at once). Each
+    session has its own queue, so background sessions accumulate under their own tab
+    instead of interrupting what you're hearing. When the speaker is free, the
+    longest-waiting session auto-plays. Pausing a session holds the speaker for it;
+    pressing Play on another tab switches the speaker to that session and pauses the
+    first exactly where it was.
 """
 
 import os
@@ -43,12 +50,12 @@ import edge_tts  # noqa: E402  (used directly for WordBoundary timings)
 
 CLAUDE_PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
-GLOBAL_PAUSE_FLAG = os.path.join(os.path.expanduser("~"), ".claude", "speech-paused")
 
 # Only actively tail files touched within this window (keeps stat load bounded).
 ACTIVE_WINDOW_SEC = 2 * 60 * 60
 POLL_SEC = 1.0
 RESCAN_SEC = 3.0
+TICK_SEC = 0.04
 
 
 def now_ms():
@@ -112,27 +119,33 @@ class Channel:
 
 
 class Utterance:
-    __slots__ = ("session", "msg_id", "seq", "text", "gen")
+    __slots__ = ("session", "msg_id", "seq", "text", "full", "gen", "tok", "idx")
 
-    def __init__(self, session, msg_id, seq, text, gen):
+    def __init__(self, session, msg_id, seq, text, full, gen, tok, idx):
         self.session = session
         self.msg_id = msg_id
         self.seq = seq
-        self.text = text
-        self.gen = gen
+        self.text = text        # this chunk
+        self.full = full        # whole message text (for restart)
+        self.gen = gen          # global generation (stop_all)
+        self.tok = tok          # per-session token (per-session stop/replay)
+        self.idx = idx          # this chunk's position within the message
 
 
 class PlayItem:
-    __slots__ = ("session", "msg_id", "seq", "text", "path", "words", "gen")
+    __slots__ = ("session", "msg_id", "seq", "text", "full", "path", "words",
+                 "gen", "idx")
 
-    def __init__(self, session, msg_id, seq, text, path, words, gen):
+    def __init__(self, session, msg_id, seq, text, full, path, words, gen, idx):
         self.session = session
         self.msg_id = msg_id
         self.seq = seq
         self.text = text
+        self.full = full
         self.path = path
         self.words = words
         self.gen = gen
+        self.idx = idx
 
 
 # ─── Session bookkeeping ───────────────────────────────────────────────────────
@@ -146,10 +159,32 @@ class Session:
         self.config_dir = os.path.dirname(path)
         self.file_pos = 0
         self.identity = None        # inode, to detect file replacement
-        self.muted = False
         self.last_active = 0.0
-        # recent played utterances (text only) for "repeat / back one paragraph"
-        self.history = collections.deque(maxlen=20)
+
+        # ─ per-session playback state (guarded by Daemon.play_lock) ─
+        self.q = collections.deque()     # PlayItems waiting to play
+        self.cur = None                  # PlayItem currently on the speaker
+        self.proc = None                 # its ffplay process
+        self.sig_stopped = False         # is proc currently SIGSTOP'd?
+        self.paused = False              # user paused this session
+        self.inflight = 0                # utterances queued to synth, not yet in q
+        self.gen_token = 0               # bumped by this session's stop/replay
+        self.pending_since = 0.0         # when this session first had work waiting
+        self.playing_msg_id = None       # msg_id of the message on the speaker now
+        self.played = False              # has this session ever spoken a chunk?
+        self.state = "idle"              # idle | playing | paused | ended
+
+        # current message, for paragraph navigation (Repeat) and whole (Restart)
+        self.msg_chunks = []             # ordered chunk texts of the current message
+        self.msg_full = None             # its full text
+        self.cur_idx = 0                 # chunk index currently playing / last played
+        self.cur_started = 0.0           # monotonic time the current chunk began
+
+    def can_replay(self):
+        return self.played and bool(self.msg_chunks)
+
+    def has_work(self):
+        return self.cur is not None or bool(self.q) or self.inflight > 0
 
 
 # ─── The daemon ────────────────────────────────────────────────────────────────
@@ -164,7 +199,6 @@ class Daemon:
         self.start_epoch = time.time()
 
         self.synth_chan = Channel()
-        self.play_chan = Channel()
         self.temp_dir = tempfile.mkdtemp(prefix="claude_speak_")
         self.file_counter = 0
         self.seq_counter = 0
@@ -173,25 +207,23 @@ class Daemon:
         self._spoken = collections.OrderedDict()
         self._spoken_max = 4000
 
+        # One reentrant lock guards both the sessions dict and all playback state
+        # (queues / procs / active_sid). Using a single lock keeps ordering trivial
+        # and deadlock-free; it is only ever held for quick, non-blocking work.
+        self.play_lock = threading.RLock()
+        self.sessions_lock = self.play_lock
+
         # sessions keyed by jsonl path
         self.sessions = {}
-        self.sessions_lock = threading.Lock()
-        self.focus_sid = None       # which session repeat/back acts on
+        self.focus_sid = None       # tab the UI currently shows (for repeat default)
+        self.active_sid = None      # session that currently owns the speaker
 
         # cancellation: a message stopped mid-flight, or a global flush
         self.generation = 0                 # bumped by stop_all
         self.cancelled = collections.OrderedDict()   # cancelled msg_ids (bounded)
         self.cancel_lock = threading.Lock()
 
-        # playback control
-        self.paused = False                 # global pause
-        self.play_gate = threading.Event()  # set => playback allowed to start next item
-        self.play_gate.set()
-        self.current_proc = None
-        self.current_item = None
-        self.proc_lock = threading.Lock()
-
-        # debounce accumulator, per session
+        # debounce accumulator, per session path
         self.pending = {}                   # path -> {"text":..., "msg_id":..., "t":...}
         self.pending_lock = threading.Lock()
 
@@ -203,7 +235,7 @@ class Daemon:
 
         self._threads = [
             threading.Thread(target=self._synth_worker, daemon=True),
-            threading.Thread(target=self._play_worker, daemon=True),
+            threading.Thread(target=self._scheduler, daemon=True),
             threading.Thread(target=self._debounce_flusher, daemon=True),
             threading.Thread(target=self._watcher, daemon=True),
             threading.Thread(target=self._socket_server, daemon=True),
@@ -244,17 +276,12 @@ class Daemon:
             while len(self.cancelled) > 256:
                 self.cancelled.popitem(last=False)
 
-    def _is_session_paused(self, sess):
-        """Per-session pause = global pause flag-file, project flag-file, or mute."""
-        if sess.muted:
-            return True
-        if os.path.exists(GLOBAL_PAUSE_FLAG):
-            return True
-        if sess.config_dir and os.path.exists(
-            os.path.join(sess.config_dir, "speech-paused")
-        ):
-            return True
-        return False
+    def _session_by_sid(self, sid):
+        with self.sessions_lock:
+            for s in self.sessions.values():
+                if s.sid == sid:
+                    return s
+        return None
 
     # ─── event broadcast ────────────────────────────────────────────────────────
 
@@ -272,19 +299,26 @@ class Daemon:
 
     def emit_sessions(self):
         with self.sessions_lock:
+            sessions = list(self.sessions.values())
+        with self.play_lock:
             payload = [
                 {
                     "sid": s.sid,
                     "label": s.label,
-                    "muted": s.muted,
-                    "focus": s.sid == self.focus_sid,
+                    "state": s.state,
+                    "can_replay": s.can_replay(),
+                    "has_work": s.has_work(),
+                    "active": s.sid == self.active_sid,
                     "last_active": s.last_active,
                 }
-                for s in sorted(self.sessions.values(),
-                                key=lambda s: -s.last_active)
+                for s in sorted(sessions, key=lambda s: -s.last_active)
             ]
-        self.broadcast({"ev": "sessions", "sessions": payload,
-                        "paused": self.paused})
+        self.broadcast({"ev": "sessions", "sessions": payload})
+
+    def _set_state(self, sess, state):
+        if sess.state != state:
+            sess.state = state
+            self.emit_sessions()
 
     # ─── watcher ────────────────────────────────────────────────────────────────
 
@@ -336,7 +370,6 @@ class Daemon:
                         return os.path.basename(cwd.rstrip("/")) or cwd
         except OSError:
             pass
-        # fall back to decoding the project dir name
         return os.path.basename(os.path.dirname(path))
 
     def _watcher(self):
@@ -354,7 +387,8 @@ class Daemon:
                             if path not in self.sessions:
                                 self._register(path)
                                 found_new = True
-                    if found_new:
+                    changed_prune = self._prune()
+                    if found_new or changed_prune:
                         self.emit_sessions()
 
                 with self.sessions_lock:
@@ -369,6 +403,34 @@ class Daemon:
                 print(f"watcher error: {e}", file=sys.stderr)
 
             time.sleep(POLL_SEC)
+
+    def _prune(self):
+        """Drop sessions whose file is gone or has gone quiet, so the UI's tab list
+        tracks live conversations. Never drops one that's busy (playing / paused /
+        queued) or currently focused/active. Returns True if anything was removed."""
+        cutoff = time.time() - ACTIVE_WINDOW_SEC
+        removed = False
+        with self.play_lock:
+            for path, sess in list(self.sessions.items()):
+                gone = False
+                stale = False
+                try:
+                    stale = os.path.getmtime(path) < cutoff
+                except OSError:
+                    gone = True
+                busy = (sess.has_work() or sess.state in ("playing", "paused")
+                        or sess.sid == self.active_sid)
+                # a deleted file is definitely dead — prune even if it's the focus;
+                # a merely-quiet (stale) file stays if the UI is focused on it.
+                if not gone and sess.sid == self.focus_sid:
+                    busy = True
+                if (gone or stale) and not busy:
+                    self._drain_session(sess)
+                    self.sessions.pop(path, None)
+                    if self.focus_sid == sess.sid:
+                        self.focus_sid = None
+                    removed = True
+        return removed
 
     def _tail(self, sess):
         """Read new lines from one session file. Returns True if it became active."""
@@ -458,13 +520,30 @@ class Daemon:
                         sess = self.sessions.get(path)
                     if not sess:
                         continue
-                    for chunk in cc_speak.extract_speakable_chunks(text):
-                        self.seq_counter += 1
-                        self.synth_chan.put(
-                            Utterance(sess.sid, msg_id, self.seq_counter, chunk,
-                                      self.generation))
+                    self._enqueue_message(sess, msg_id, text)
             except Exception as e:
                 print(f"debounce error: {e}", file=sys.stderr)
+
+    def _enqueue_message(self, sess, msg_id, full_text):
+        """Split a full message into chunks and hand them to the synth worker."""
+        chunks = cc_speak.extract_speakable_chunks(full_text)
+        if not chunks:
+            return
+        with self.play_lock:
+            sess.msg_chunks = chunks       # remembered for Repeat / Restart
+            sess.msg_full = full_text
+        self._enqueue_chunks(sess, msg_id, chunks, full_text, 0)
+
+    def _enqueue_chunks(self, sess, msg_id, chunks, full_text, start_idx):
+        """Queue chunks[start_idx:] for synthesis, preserving their message index."""
+        for i in range(start_idx, len(chunks)):
+            self.seq_counter += 1
+            with self.play_lock:
+                sess.inflight += 1
+                tok = sess.gen_token
+            self.synth_chan.put(
+                Utterance(sess.sid, msg_id, self.seq_counter, chunks[i], full_text,
+                          self.generation, tok, i))
 
     # ─── synth worker ───────────────────────────────────────────────────────────
 
@@ -475,14 +554,12 @@ class Daemon:
             u = self.synth_chan.get()
             if u is None:
                 continue
+            sess = self._session_by_sid(u.session)
             try:
                 if self._is_cancelled(u):
                     continue
                 cleaned = cc_speak.clean_text(u.text, skip_code=True, skip_paths=True)
                 if not cleaned.strip() or len(cleaned.split()) < 3:
-                    continue
-                sess = self._session_by_sid(u.session)
-                if sess and self._is_session_paused(sess):
                     continue
                 self.file_counter += 1
                 out = os.path.join(self.temp_dir, f"s{self.file_counter}.mp3")
@@ -492,12 +569,22 @@ class Daemon:
                 if self._is_cancelled(u):       # stopped while we were synthesizing
                     self._safe_remove(out)
                     continue
-                if os.path.exists(out) and os.path.getsize(out) > 0:
-                    self.play_chan.put(
-                        PlayItem(u.session, u.msg_id, u.seq, cleaned, out, words,
-                                 u.gen))
+                if os.path.exists(out) and os.path.getsize(out) > 0 and sess is not None:
+                    item = PlayItem(u.session, u.msg_id, u.seq, cleaned, u.full,
+                                    out, words, u.gen, u.idx)
+                    with self.play_lock:
+                        if u.tok != sess.gen_token:     # session stopped/replayed since
+                            self._safe_remove(out)
+                        else:
+                            if not sess.q and sess.cur is None:
+                                sess.pending_since = time.time()
+                            sess.q.append(item)
             except Exception as e:
                 print(f"synth error: {e}", file=sys.stderr)
+            finally:
+                if sess is not None:
+                    with self.play_lock:
+                        sess.inflight = max(0, sess.inflight - 1)
 
     async def _synth(self, text, voice, rate, out_path):
         """edge-tts streaming: write audio + collect word timings (ms)."""
@@ -514,13 +601,6 @@ class Daemon:
                         "w": chunk["text"],
                     })
         return words
-
-    def _session_by_sid(self, sid):
-        with self.sessions_lock:
-            for s in self.sessions.values():
-                if s.sid == sid:
-                    return s
-        return None
 
     def _voice_for(self, sess):
         if sess:
@@ -544,67 +624,144 @@ class Daemon:
                 pass
         return self.voice
 
-    # ─── playback worker ────────────────────────────────────────────────────────
+    # ─── scheduler: plays one session (the active one) at a time ────────────────
 
-    def _play_worker(self):
+    def _scheduler(self):
         while self.running:
-            item = self.play_chan.get()
-            if item is None:
-                continue
             try:
+                with self.play_lock:
+                    self._schedule_tick()
+            except Exception as e:
+                print(f"scheduler error: {e}", file=sys.stderr)
+            time.sleep(TICK_SEC)
+
+    def _pick_active(self):
+        """Return the session that should own the speaker right now (or None)."""
+        with self.sessions_lock:
+            sessions = list(self.sessions.values())
+        by_sid = {s.sid: s for s in sessions}
+
+        if self.active_sid:
+            s = by_sid.get(self.active_sid)
+            # a paused session with a chunk in hand keeps holding the speaker
+            if s and (s.cur is not None or s.q or s.inflight > 0):
+                return s
+            if s is not None and s.state == "playing":
+                self._set_state(s, "ended")     # drained: nothing left to say
+            self.active_sid = None
+
+        # speaker is free: auto-play the session that has waited longest
+        cand = [s for s in sessions
+                if not s.paused and (s.cur is not None or s.q)]
+        if not cand:
+            return None
+        cand.sort(key=lambda s: s.pending_since)
+        self.active_sid = cand[0].sid
+        return cand[0]
+
+    def _schedule_tick(self):
+        sess = self._pick_active()
+        if sess is None:
+            return
+
+        # need a current chunk?
+        if sess.cur is None:
+            if sess.q:
+                item = sess.q.popleft()
                 if self._is_cancelled(item):
                     self._safe_remove(item.path)
-                    continue
-                sess = self._session_by_sid(item.session)
-                if sess and self._is_session_paused(sess):
-                    self._safe_remove(item.path)
-                    continue
-                # wait out a global pause that happened between items
-                while self.running and not self.play_gate.is_set():
-                    self.play_gate.wait(0.2)
-                if not self.running:
-                    break
+                    return
+                sess.cur = item
+                sess.proc = None
+                sess.sig_stopped = False
+            else:
+                # nothing left to play for this session right now
+                if sess.inflight == 0 and sess.state == "playing":
+                    self._set_state(sess, "ended")
+                    if self.active_sid == sess.sid and not sess.paused:
+                        self.active_sid = None
+                return
 
-                if sess:
-                    sess.history.append(item.text)
-                self.current_item = item
-                # tell UI what is about to be spoken + the word timings
-                self.broadcast({
-                    "ev": "play",
-                    "sid": item.session,
-                    "msg_id": item.msg_id,
-                    "seq": item.seq,
-                    "text": item.text,
-                    "words": item.words,
-                    "epoch_ms": now_ms(),
-                })
-                self._play_file(item.path)
-                self.broadcast({"ev": "end", "sid": item.session, "seq": item.seq})
-                self.current_item = None
-                self._safe_remove(item.path)
-            except Exception as e:
-                print(f"play error: {e}", file=sys.stderr)
-                self.current_item = None
-                self._safe_remove(item.path)
+        # have a current chunk: launch it if not started
+        if sess.proc is None:
+            if sess.paused:
+                return                          # don't start audio while paused
+            self._start_proc(sess)
+            return
 
-    def _play_file(self, path):
+        # proc exists: manage pause/resume and completion
+        rc = sess.proc.poll()
+        if rc is None:
+            if sess.paused and not sess.sig_stopped:
+                self._signal(sess.proc, signal.SIGSTOP)
+                sess.sig_stopped = True
+            elif not sess.paused and sess.sig_stopped:
+                self._signal(sess.proc, signal.SIGCONT)
+                sess.sig_stopped = False
+            return
+
+        # chunk finished
+        self._safe_remove(sess.cur.path)
+        self.broadcast({"ev": "end", "sid": sess.sid, "seq": sess.cur.seq})
+        sess.cur = None
+        sess.proc = None
+        sess.sig_stopped = False
+
+    def _start_proc(self, sess):
+        item = sess.cur
+        sess.playing_msg_id = item.msg_id
+        sess.cur_idx = item.idx                  # where we are in the message
+        sess.cur_started = time.monotonic()
+        sess.played = True
+        proc = self._spawn_ffplay(item.path)
+        sess.proc = proc
+        sess.sig_stopped = False
+        self._set_state(sess, "playing")
+        self.broadcast({
+            "ev": "play",
+            "sid": sess.sid,
+            "msg_id": item.msg_id,
+            "seq": item.seq,
+            "idx": item.idx,
+            "text": item.text,
+            "words": item.words,
+            "epoch_ms": now_ms(),
+        })
+
+    def _spawn_ffplay(self, path):
         import shutil
         ffplay = shutil.which("ffplay")
         if not ffplay:
-            cc_speak.play_audio(path)    # fallback (not pausable)
-            return
+            # no controllable player: fall back to a blocking play (rare)
+            threading.Thread(target=cc_speak.play_audio, args=(path,),
+                             daemon=True).start()
+            return _DummyProc()
         import subprocess
         try:
-            proc = subprocess.Popen(
+            return subprocess.Popen(
                 [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
+            return _DummyProc()
+
+    @staticmethod
+    def _signal(proc, sig):
+        try:
+            proc.send_signal(sig)
+        except (OSError, ValueError):
+            pass
+
+    def _kill(self, proc):
+        if proc is None:
             return
-        with self.proc_lock:
-            self.current_proc = proc
-        proc.wait()
-        with self.proc_lock:
-            self.current_proc = None
+        try:
+            proc.send_signal(signal.SIGCONT)    # in case it was paused
+        except (OSError, ValueError):
+            pass
+        try:
+            proc.kill()
+        except (OSError, ValueError):
+            pass
 
     @staticmethod
     def _safe_remove(path):
@@ -614,98 +771,181 @@ class Daemon:
         except OSError:
             pass
 
-    # ─── transport commands ────────────────────────────────────────────────────
+    # ─── transport commands (all per-session) ───────────────────────────────────
 
-    def cmd_pause(self):
-        self.paused = True
-        self.play_gate.clear()
-        with self.proc_lock:
-            if self.current_proc:
-                try:
-                    self.current_proc.send_signal(signal.SIGSTOP)
-                except OSError:
-                    pass
-        self.broadcast({"ev": "pause"})
-        self.emit_sessions()
+    def cmd_pause(self, sid=None):
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=True)
+            if not sess:
+                return
+            sess.paused = True
+            if sess.proc is not None and not sess.sig_stopped:
+                self._signal(sess.proc, signal.SIGSTOP)
+                sess.sig_stopped = True
+            self._set_state(sess, "paused")
+        self.broadcast({"ev": "pause", "sid": sess.sid})
 
-    def cmd_resume(self):
-        self.paused = False
-        self.play_gate.set()
-        with self.proc_lock:
-            if self.current_proc:
-                try:
-                    self.current_proc.send_signal(signal.SIGCONT)
-                except OSError:
-                    pass
-        self.broadcast({"ev": "resume"})
-        self.emit_sessions()
+    def cmd_resume(self, sid=None):
+        """Resume / play the given session, making it the active speaker."""
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=True)
+            if not sess:
+                return
+            # switching speaker: pause whoever holds it now
+            if self.active_sid and self.active_sid != sess.sid:
+                other = self._session_by_sid(self.active_sid)
+                if other and other.proc is not None and not other.sig_stopped:
+                    other.paused = True
+                    self._signal(other.proc, signal.SIGSTOP)
+                    other.sig_stopped = True
+                    self._set_state(other, "paused")
+            self.active_sid = sess.sid
+            sess.paused = False
+            if sess.proc is not None and sess.sig_stopped:
+                self._signal(sess.proc, signal.SIGCONT)
+                sess.sig_stopped = False
+            if sess.cur is not None or sess.q or sess.inflight > 0:
+                self._set_state(sess, "playing")
+        self.broadcast({"ev": "resume", "sid": sess.sid})
 
-    def cmd_skip(self):
+    def cmd_toggle(self, sid=None):
+        sess = self._resolve(sid, prefer_active=True)
+        if not sess:
+            return
+        if sess.paused or sess.state != "playing":
+            self.cmd_resume(sess.sid)
+        else:
+            self.cmd_pause(sess.sid)
+
+    def cmd_skip(self, sid=None):
         """Stop the current chunk only; the next queued chunk plays."""
-        with self.proc_lock:
-            if self.current_proc:
-                try:
-                    self.current_proc.send_signal(signal.SIGCONT)  # in case paused
-                    self.current_proc.kill()
-                except OSError:
-                    pass
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=True)
+            if not sess or sess.proc is None:
+                return
+            self._kill(sess.proc)
+            # the scheduler will observe the finished proc and advance
 
-    def cmd_stop(self):
-        """Silence the rest of the CURRENT message: kill player + drop its chunks."""
-        cur = self.current_item
-        if cur is not None:
-            mid = cur.msg_id
-            self._mark_cancelled(mid)       # also cancels in-flight synthesis
-            self.play_chan.drop_where(lambda x: x.msg_id == mid)
-            self.synth_chan.drop_where(lambda x: x.msg_id == mid)
-        with self.proc_lock:
-            if self.current_proc:
-                try:
-                    self.current_proc.send_signal(signal.SIGCONT)
-                    self.current_proc.kill()
-                except OSError:
-                    pass
+    def cmd_stop(self, sid=None):
+        """Silence a whole session: kill its player and drop its queue + backlog."""
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=True)
+            if not sess:
+                return
+            sess.gen_token += 1             # invalidate this session's in-flight synth
+            if sess.cur is not None:
+                self._mark_cancelled(sess.cur.msg_id)
+            self._drain_session(sess)
+            self._kill(sess.proc)
+            sess.proc = None
+            sess.sig_stopped = False
+            if sess.cur is not None:
+                self._safe_remove(sess.cur.path)
+            sess.cur = None
+            sess.paused = False
+            sess.inflight = 0
+            sess.playing_msg_id = None
+            if self.active_sid == sess.sid:
+                self.active_sid = None
+            self._set_state(sess, "ended" if sess.can_replay() else "idle")
 
     def cmd_stop_all(self):
         """Silence everything queued, across all sessions."""
-        self.generation += 1                # cancels everything in flight
-        self.play_chan.drop_where(lambda x: True)
-        self.synth_chan.drop_where(lambda x: True)
+        with self.play_lock:
+            self.generation += 1
+            self.synth_chan.drop_where(lambda x: True)
+            with self.sessions_lock:
+                sessions = list(self.sessions.values())
+            for sess in sessions:
+                sess.gen_token += 1
+                self._drain_session(sess)
+                self._kill(sess.proc)
+                if sess.cur is not None:
+                    self._safe_remove(sess.cur.path)
+                sess.cur = None
+                sess.proc = None
+                sess.sig_stopped = False
+                sess.paused = False
+                sess.inflight = 0
+                sess.playing_msg_id = None
+                sess.state = "ended" if sess.can_replay() else "idle"
+            self.active_sid = None
         with self.pending_lock:
             self.pending.clear()
-        with self.proc_lock:
-            if self.current_proc:
-                try:
-                    self.current_proc.send_signal(signal.SIGCONT)
-                    self.current_proc.kill()
-                except OSError:
-                    pass
+        self.emit_sessions()
+
+    # how long into a paragraph a Repeat still counts as "restart this one" before
+    # it instead steps back to the previous paragraph (music-player behaviour)
+    REPEAT_BACK_SEC = 1.8
 
     def cmd_repeat(self, sid=None):
-        """Re-speak the last paragraph of the focused (or given) session."""
-        sid = sid or self.focus_sid
-        sess = self._session_by_sid(sid) if sid else None
-        if not sess or not sess.history:
-            return
-        text = sess.history[-1]
-        self.seq_counter += 1
-        self.synth_chan.put_front(
-            Utterance(sess.sid, "_repeat_%d" % self.seq_counter, self.seq_counter,
-                      text, self.generation))
+        """Paragraph navigation: restart the current paragraph, or — if we're already
+        at its start — step back to the previous one, then play forward from there."""
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=False)
+            if not sess or not sess.msg_chunks or not sess.played:
+                return
+            playing = (sess.cur is not None and sess.proc is not None
+                       and not sess.paused)
+            elapsed = time.monotonic() - sess.cur_started
+            if playing and elapsed > self.REPEAT_BACK_SEC:
+                target = sess.cur_idx           # far enough in: restart this paragraph
+            else:
+                target = sess.cur_idx - 1        # at the start: go to the previous one
+            target = max(0, min(target, len(sess.msg_chunks) - 1))
+            chunks, full = sess.msg_chunks, sess.msg_full
+            self._clear_for_seek(sess)
+            msg_id = "_nav_%d" % (self.seq_counter + 1)
+        self._enqueue_chunks(sess, msg_id, chunks, full, target)
 
-    def cmd_mute(self, sid, muted):
-        sess = self._session_by_sid(sid)
-        if sess:
-            sess.muted = muted
-            if muted:
-                # drop anything queued for it
-                self.play_chan.drop_where(lambda x: x.session == sid)
-                self.synth_chan.drop_where(lambda x: x.session == sid)
-            self.emit_sessions()
+    def cmd_restart(self, sid=None):
+        """Re-speak the whole current message from the beginning."""
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=False)
+            if not sess or not sess.msg_chunks or not sess.played:
+                return
+            chunks, full = sess.msg_chunks, sess.msg_full
+            self._clear_for_seek(sess)
+            msg_id = "_nav_%d" % (self.seq_counter + 1)
+        self._enqueue_chunks(sess, msg_id, chunks, full, 0)
+
+    def _clear_for_seek(self, sess):
+        """Tear down a session's current playback so it can be re-queued from a
+        chosen paragraph. Keeps msg_chunks/msg_full intact for navigation."""
+        sess.gen_token += 1                 # invalidate this session's in-flight synth
+        if sess.cur is not None:
+            self._mark_cancelled(sess.cur.msg_id)
+            self._safe_remove(sess.cur.path)
+        self._drain_session(sess)
+        self._kill(sess.proc)
+        sess.cur = None
+        sess.proc = None
+        sess.sig_stopped = False
+        sess.paused = False
+        sess.inflight = 0
+        sess.playing_msg_id = None
+        self.active_sid = sess.sid
+        self._set_state(sess, "playing")
 
     def cmd_focus(self, sid):
         self.focus_sid = sid
-        self.emit_sessions()
+
+    def _drain_session(self, sess):
+        """Remove all queued PlayItems for a session and delete their temp files."""
+        while sess.q:
+            item = sess.q.popleft()
+            self._safe_remove(item.path)
+        self.synth_chan.drop_where(lambda x: x.session == sess.sid)
+
+    def _resolve(self, sid, prefer_active):
+        """Pick the session a command targets: explicit sid, else active/focus."""
+        if sid:
+            return self._session_by_sid(sid)
+        if prefer_active and self.active_sid:
+            return self._session_by_sid(self.active_sid)
+        if self.focus_sid:
+            return self._session_by_sid(self.focus_sid)
+        return None
 
     # ─── socket server ──────────────────────────────────────────────────────────
 
@@ -766,23 +1006,21 @@ class Daemon:
         cmd = msg.get("cmd")
         sid = msg.get("sid")
         if cmd == "pause":
-            self.cmd_pause()
-        elif cmd == "resume":
-            self.cmd_resume()
+            self.cmd_pause(sid)
+        elif cmd == "resume" or cmd == "play":
+            self.cmd_resume(sid)
         elif cmd == "toggle":
-            self.cmd_resume() if self.paused else self.cmd_pause()
+            self.cmd_toggle(sid)
         elif cmd == "skip":
-            self.cmd_skip()
+            self.cmd_skip(sid)
         elif cmd == "stop":
-            self.cmd_stop()
+            self.cmd_stop(sid)
         elif cmd == "stop_all":
             self.cmd_stop_all()
-        elif cmd == "repeat" or cmd == "back":
+        elif cmd in ("repeat", "back"):
             self.cmd_repeat(sid)
-        elif cmd == "mute":
-            self.cmd_mute(sid, True)
-        elif cmd == "unmute":
-            self.cmd_mute(sid, False)
+        elif cmd == "restart":
+            self.cmd_restart(sid)
         elif cmd == "focus":
             self.cmd_focus(sid)
         elif cmd == "ping":
@@ -792,8 +1030,20 @@ class Daemon:
         self.running = False
         self.cmd_stop_all()
         self.synth_chan.close()
-        self.play_chan.close()
         self._cleanup()
+
+
+class _DummyProc:
+    """Stand-in when no controllable player exists; behaves as an instantly-done proc."""
+
+    def poll(self):
+        return 0
+
+    def send_signal(self, sig):
+        pass
+
+    def kill(self):
+        pass
 
 
 def main():

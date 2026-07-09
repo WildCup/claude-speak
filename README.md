@@ -47,4 +47,5 @@ pkill -f "speak_daemon.py"
 ~/.config/systemd/user/claude-speak.service
 systemctl --user status claude-speak
 
-
+# UI
+.venv/bin/python speak_ui.py

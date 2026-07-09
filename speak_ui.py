@@ -1,104 +1,226 @@
 #!/usr/bin/env python3
 """
-speak_ui: tiny transport window for the claude-speak daemon.
+speak_ui: a tiny transport window for the claude-speak daemon.
 
-  - one tab per active Claude session (auto-created)
-  - transport buttons: pause/resume, stop-this-message, skip, repeat, silence-all
-  - live word highlighting of the current paragraph (edge-tts WordBoundary timing)
-  - per-tab mute, so a noisy session can be silenced while another keeps talking
+  - one pill tab per active Claude session, along the top
+  - "Stop all" on the top right
+  - transport buttons act on the SELECTED tab's session, and enable / disable /
+    morph to match that session's state (Pause<->Resume, Stop<->Restart)
+  - live word highlighting of the current paragraph (edge-tts WordBoundary timing),
+    spoken words dimmed
 
 Run alongside the daemon:
     .venv/bin/python speak_ui.py
 """
 
 import os
+import math
 import json
 import time
 import socket
 import threading
 import queue
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, font as tkfont
 
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
+
+# ─── palette ───────────────────────────────────────────────────────────────────
+BG        = "#f4f4f6"
+CARD      = "#ffffff"
+INK       = "#20222a"
+MUTED     = "#8a8d98"
+ACCENT    = "#4c8bf5"
+ACCENT_HI = "#3b73d6"
+PILL_BG   = "#e6e7ec"
+PILL_HI   = "#d5d7df"
+BTN_BG    = "#eceef2"
+BTN_HI    = "#dfe2e8"
+BORDER    = "#e0e1e6"
+HL_BG     = "#ffe08a"     # word being spoken
+SPOKEN    = "#9a9da8"     # words already spoken
 
 
 class SpeakUI:
     def __init__(self, root):
         self.root = root
         root.title("claude-speak")
-        root.geometry("520x300")
-        root.minsize(380, 200)
+        root.geometry("560x340")
+        root.minsize(420, 240)
+        root.configure(bg=BG)
 
         self.events = queue.Queue()
         self.sock = None
         self.sock_lock = threading.Lock()
-        self.connected = False
 
-        self.tabs = {}          # sid -> dict(frame, text, label, muted_var)
-        self.paused = False
+        self.order = []                 # sids, in display order
+        self.sessions = {}              # sid -> dict(label,state,can_replay,has_work,active)
+        self.pills = {}                 # sid -> tk.Label pill widget
+        self.selected = None            # selected sid
+        self.follow = True              # auto-select the session that starts talking
 
-        # current-playback highlight state (only one plays at a time)
-        self.cur_sid = None
-        self.cur_words = []
-        self.cur_spans = []
-        self.t0 = None
-        self.pause_accum = 0.0
-        self._pause_started = None
+        # per-session read-along state
+        self.view = {}                  # sid -> dict(text,words,spans,t0,pause_accum,pause_started)
 
+        self._fonts()
+        self._set_icon()
         self._build()
         threading.Thread(target=self._reader, daemon=True).start()
         self.root.after(33, self._tick)
         self.root.after(50, self._drain)
 
-    # ─── widgets ──────────────────────────────────────────────────────────────
+    # ─── fonts / styles ─────────────────────────────────────────────────────────
+
+    def _fonts(self):
+        self.f_read = tkfont.Font(family="DejaVu Sans", size=13)
+        self.f_pill = tkfont.Font(family="DejaVu Sans", size=10, weight="bold")
+        self.f_btn = tkfont.Font(family="DejaVu Sans", size=11)
+        self.f_status = tkfont.Font(family="DejaVu Sans", size=9)
+
+    def _set_icon(self):
+        """A speaker-with-soundwaves app icon, drawn into a PhotoImage (no assets)."""
+        S = 64
+        cx, cy = 30.0, 32.0
+        rows = []
+        for y in range(S):
+            row = []
+            for x in range(S):
+                c = ACCENT
+                if 14 <= x <= 23 and 25 <= y <= 39:            # speaker back plate
+                    c = "#ffffff"
+                elif 23 < x <= 33:                              # speaker cone
+                    hh = 6 + (x - 23) * 0.9
+                    if cy - hh <= y <= cy + hh:
+                        c = "#ffffff"
+                else:                                           # two sound-wave arcs
+                    d = math.hypot(x - 24, y - cy)
+                    if x >= 35 and abs(y - cy) <= (x - 26) * 0.95 \
+                            and (15.5 <= d <= 17.3 or 21.0 <= d <= 22.8):
+                        c = "#ffffff"
+                row.append(c)
+            rows.append("{" + " ".join(row) + "}")
+        try:
+            img = tk.PhotoImage(width=S, height=S)
+            img.put(" ".join(rows))
+            self.root.iconphoto(True, img)
+            self._icon = img            # keep a ref so it isn't garbage-collected
+        except tk.TclError:
+            pass
+
+    # ─── widgets ────────────────────────────────────────────────────────────────
 
     def _build(self):
-        bar = ttk.Frame(self.root, padding=(6, 6))
-        bar.pack(side=tk.TOP, fill=tk.X)
+        # top: tab strip (left) + stop-all (right)
+        top = tk.Frame(self.root, bg=BG)
+        top.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 6))
 
-        self.btn_pause = ttk.Button(bar, text="⏸ Pause", width=10,
-                                    command=self._toggle)
-        self.btn_pause.pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="⏮ Repeat", width=9,
-                   command=lambda: self.send("repeat", self.cur_sid)
-                   ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="⏭ Skip", width=8,
-                   command=lambda: self.send("skip")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="⏹ Stop msg", width=10,
-                   command=lambda: self.send("stop")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="🔇 All", width=6,
-                   command=lambda: self.send("stop_all")).pack(side=tk.LEFT, padx=2)
+        self.stopall = tk.Label(top, text="⏹  Stop all", font=self.f_pill,
+                                bg=PILL_BG, fg=INK, padx=12, pady=6, cursor="hand2")
+        self.stopall.pack(side=tk.RIGHT)
+        self._hover(self.stopall, PILL_BG, PILL_HI)
+        self.stopall.bind("<Button-1>", lambda e: self.send("stop_all"))
 
-        self.status = ttk.Label(self.root, text="connecting…", anchor=tk.W,
-                                padding=(8, 2))
+        self.tabstrip = tk.Frame(top, bg=BG)
+        self.tabstrip.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Pack the fixed strips (status, transport) from the bottom FIRST, so the
+        # reading card's expand=True only claims the leftover middle — otherwise the
+        # card eats everything and the transport bar collapses to zero height.
+        self.status = tk.Label(self.root, text="connecting…", anchor=tk.W,
+                               font=self.f_status, bg=BG, fg=MUTED, padx=12, pady=3)
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
+        # transport for the selected session
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(6, 6))
+        self.b_repeat = self._tbtn(bar, "⏮  Repeat", lambda: self.send("repeat", self.selected))
+        self.b_play   = self._tbtn(bar, "⏸  Pause", self._toggle)
+        self.b_skip   = self._tbtn(bar, "⏭  Skip", lambda: self.send("skip", self.selected))
+        self.b_stop   = self._tbtn(bar, "⏹  Stop", self._stop_or_restart)
 
-    def _ensure_tab(self, sid, label):
-        if sid in self.tabs:
-            return self.tabs[sid]
-        frame = ttk.Frame(self.nb)
-        top = ttk.Frame(frame)
-        top.pack(side=tk.TOP, fill=tk.X)
-        muted_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="mute", variable=muted_var,
-                        command=lambda s=sid, v=muted_var: self.send(
-                            "unmute" if not v.get() else "mute", s)
-                        ).pack(side=tk.RIGHT, padx=4, pady=2)
-        text = tk.Text(frame, wrap=tk.WORD, height=8, font=("DejaVu Sans", 12),
-                       relief=tk.FLAT, padx=8, pady=6, state=tk.DISABLED,
-                       cursor="arrow")
-        text.pack(fill=tk.BOTH, expand=True)
-        text.tag_configure("hl", background="#ffe08a")
-        text.tag_configure("spoken", foreground="#888888")
-        self.nb.add(frame, text=label or sid[:8])
-        self.tabs[sid] = {"frame": frame, "text": text, "label": label,
-                          "muted_var": muted_var}
-        return self.tabs[sid]
+        # middle: reading card (fills whatever is left between top and bottom strips)
+        card = tk.Frame(self.root, bg=BORDER)
+        card.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=2)
+        self.text = tk.Text(card, wrap=tk.WORD, font=self.f_read, relief=tk.FLAT,
+                            bg=CARD, fg=INK, padx=14, pady=12, state=tk.DISABLED,
+                            cursor="arrow", highlightthickness=0, borderwidth=0)
+        self.text.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self.text.tag_configure("hl", background=HL_BG, foreground=INK)
+        self.text.tag_configure("spoken", foreground=SPOKEN)
+        self.text.tag_configure("idle", foreground=MUTED)
+
+        self._refresh_buttons()
+
+    def _tbtn(self, parent, text, cmd):
+        b = tk.Label(parent, text=text, font=self.f_btn, bg=BTN_BG, fg=INK,
+                     padx=14, pady=7, cursor="hand2")
+        b.pack(side=tk.LEFT, padx=(0, 6))
+        b._cmd = cmd
+        b._enabled = True
+        self._hover(b, BTN_BG, BTN_HI)
+        b.bind("<Button-1>", lambda e, w=b: w._cmd() if w._enabled else None)
+        return b
+
+    def _hover(self, w, base, hi):
+        w._base = base
+        w.bind("<Enter>", lambda e: w.configure(bg=hi) if getattr(w, "_enabled", True) else None)
+        w.bind("<Leave>", lambda e: w.configure(bg=getattr(w, "_base", base)))
+
+    def _set_enabled(self, b, on, text=None):
+        b._enabled = on
+        if text is not None:
+            b.configure(text=text)
+        if on:
+            b.configure(fg=INK, bg=b._base, cursor="hand2")
+        else:
+            b.configure(fg="#c2c4cc", bg=BTN_BG, cursor="arrow")
+
+    # ─── tab strip ──────────────────────────────────────────────────────────────
+
+    def _rebuild_tabs(self):
+        for w in self.tabstrip.winfo_children():
+            w.destroy()
+        self.pills = {}
+        # disambiguate sessions that share a label (e.g. two convos in one project)
+        counts = {}
+        for sid in self.order:
+            lbl = self.sessions.get(sid, {}).get("label") or sid[:8]
+            counts[lbl] = counts.get(lbl, 0) + 1
+        for sid in self.order:
+            s = self.sessions.get(sid, {})
+            label = s.get("label") or sid[:8]
+            if counts.get(label, 0) > 1:
+                label = f"{label}·{sid[:4]}"
+            dot = {"playing": "● ", "paused": "❚❚ ", "ended": "", "idle": ""}.get(
+                s.get("state"), "")
+            pill = tk.Label(self.tabstrip, text=dot + label, font=self.f_pill,
+                            padx=12, pady=6, cursor="hand2")
+            pill.pack(side=tk.LEFT, padx=(0, 6))
+            pill.bind("<Button-1>", lambda e, x=sid: self._select(x, user=True))
+            self.pills[sid] = pill
+        self._paint_pills()
+
+    def _paint_pills(self):
+        for sid, pill in self.pills.items():
+            if sid == self.selected:
+                pill.configure(bg=ACCENT, fg="#ffffff")
+                pill._base = ACCENT
+                pill.unbind("<Enter>"); pill.unbind("<Leave>")
+            else:
+                pill.configure(bg=PILL_BG, fg=INK)
+                self._hover(pill, PILL_BG, PILL_HI)
+
+    def _select(self, sid, user=False):
+        if sid not in self.sessions:
+            return
+        if user:
+            # user picked a tab: stop auto-following the talking session
+            self.follow = (self.sessions.get(sid, {}).get("state") == "playing")
+        self.selected = sid
+        self.send("focus", sid)
+        self._paint_pills()
+        self._refresh_text()
+        self._refresh_buttons()
 
     # ─── networking ───────────────────────────────────────────────────────────
 
@@ -111,10 +233,8 @@ class SpeakUI:
                     s.connect(SOCKET_PATH)
                     with self.sock_lock:
                         self.sock = s
-                    self.connected = True
                     self.events.put({"ev": "_connected"})
                 except OSError:
-                    self.connected = False
                     self.events.put({"ev": "_disconnected"})
                     time.sleep(1.0)
                     continue
@@ -132,7 +252,6 @@ class SpeakUI:
             except OSError:
                 with self.sock_lock:
                     self.sock = None
-                self.connected = False
                 self.events.put({"ev": "_disconnected"})
                 buf = b""
                 time.sleep(1.0)
@@ -150,15 +269,25 @@ class SpeakUI:
                 self.sock = None
 
     def _toggle(self):
-        self.send("toggle")
+        s = self.sessions.get(self.selected, {})
+        if s.get("state") == "playing":
+            self.send("pause", self.selected)
+        else:
+            self.send("resume", self.selected)
+
+    def _stop_or_restart(self):
+        s = self.sessions.get(self.selected, {})
+        if s.get("state") in ("playing", "paused"):
+            self.send("stop", self.selected)
+        else:
+            self.send("restart", self.selected)
 
     # ─── event handling (main thread) ──────────────────────────────────────────
 
     def _drain(self):
         try:
             while True:
-                ev = self.events.get_nowait()
-                self._handle(ev)
+                self._handle(self.events.get_nowait())
         except queue.Empty:
             pass
         self.root.after(50, self._drain)
@@ -177,61 +306,135 @@ class SpeakUI:
         elif kind == "end":
             self._on_end(ev)
         elif kind == "pause":
-            self.paused = True
-            self._pause_started = time.monotonic()
-            self.btn_pause.config(text="▶ Resume")
+            self._on_pause(ev.get("sid"))
         elif kind == "resume":
-            self.paused = False
-            if self._pause_started is not None:
-                self.pause_accum += time.monotonic() - self._pause_started
-                self._pause_started = None
-            self.btn_pause.config(text="⏸ Pause")
+            self._on_resume(ev.get("sid"))
 
     def _update_sessions(self, ev):
-        self.paused = ev.get("paused", False)
-        self.btn_pause.config(text="▶ Resume" if self.paused else "⏸ Pause")
-        for s in ev.get("sessions", []):
-            tab = self._ensure_tab(s["sid"], s["label"])
-            tab["muted_var"].set(s.get("muted", False))
-            try:
-                self.nb.tab(tab["frame"], text=(
-                    ("🔇 " if s.get("muted") else "") + (s["label"] or s["sid"][:8])))
-            except tk.TclError:
-                pass
-        n = len(ev.get("sessions", []))
+        sess = ev.get("sessions", [])
+        self.sessions = {s["sid"]: s for s in sess}
+        self.order = [s["sid"] for s in sess]
+        if self.selected not in self.sessions:
+            self.selected = self.order[0] if self.order else None
+        self._rebuild_tabs()
+        self._refresh_text()
+        self._refresh_buttons()
+        n = len(sess)
+        talk = sum(1 for s in sess if s["state"] == "playing")
         self.status.config(text=f"connected · {n} session(s)"
-                           + (" · paused" if self.paused else ""))
+                           + (f" · {talk} speaking" if talk else ""))
 
     def _on_play(self, ev):
         sid = ev.get("sid")
-        tab = self._ensure_tab(sid, ev.get("label") or sid)
         text = ev.get("text", "")
-        self.cur_sid = sid
-        self.cur_words = ev.get("words", [])
-        self.cur_spans = self._map_spans(text, self.cur_words)
-        self.t0 = time.monotonic()
-        self.pause_accum = 0.0
-        self._pause_started = time.monotonic() if self.paused else None
-
-        w = tab["text"]
-        w.config(state=tk.NORMAL)
-        w.delete("1.0", tk.END)
-        w.insert("1.0", text)
-        w.config(state=tk.DISABLED)
-        # focus the tab that's speaking
-        try:
-            self.nb.select(tab["frame"])
-        except tk.TclError:
-            pass
+        words = ev.get("words", [])
+        self.view[sid] = {
+            "text": text, "words": words, "spans": self._map_spans(text, words),
+            "t0": time.monotonic(), "pause_accum": 0.0, "pause_started": None,
+        }
+        if self.follow or sid == self.selected or self.selected is None:
+            self.selected = sid
+            self.follow = True
+            self._paint_pills()
+        if sid == self.selected:
+            self._refresh_text()
+        self._refresh_buttons()
 
     def _on_end(self, ev):
-        if ev.get("sid") == self.cur_sid:
-            tab = self.tabs.get(self.cur_sid)
-            if tab:
-                tab["text"].tag_remove("hl", "1.0", tk.END)
-            self.cur_words = []
-            self.cur_spans = []
-            self.t0 = None
+        sid = ev.get("sid")
+        v = self.view.get(sid)
+        if v:
+            v["t0"] = None
+        if sid == self.selected:
+            self.text.tag_remove("hl", "1.0", tk.END)
+
+    def _on_pause(self, sid):
+        v = self.view.get(sid)
+        if v and v.get("t0") is not None and v.get("pause_started") is None:
+            v["pause_started"] = time.monotonic()
+
+    def _on_resume(self, sid):
+        v = self.view.get(sid)
+        if v and v.get("pause_started") is not None:
+            v["pause_accum"] += time.monotonic() - v["pause_started"]
+            v["pause_started"] = None
+
+    # ─── reading card ───────────────────────────────────────────────────────────
+
+    def _refresh_text(self):
+        w = self.text
+        w.config(state=tk.NORMAL)
+        w.delete("1.0", tk.END)
+        v = self.view.get(self.selected)
+        if v and v.get("text"):
+            w.insert("1.0", v["text"])
+        else:
+            s = self.sessions.get(self.selected, {})
+            hint = {"ended": "— finished. Repeat or Restart to hear it again. —",
+                    "paused": "— paused —"}.get(s.get("state"),
+                                                "— waiting for output… —")
+            w.insert("1.0", hint, "idle")
+        w.config(state=tk.DISABLED)
+
+    def _refresh_buttons(self):
+        s = self.sessions.get(self.selected, {}) if self.selected else {}
+        state = s.get("state", "idle")
+        can_replay = s.get("can_replay", False)
+        has_work = s.get("has_work", False)
+        active = state in ("playing", "paused")
+
+        # Pause / Resume / Play
+        if state == "playing":
+            self._set_enabled(self.b_play, True, "⏸  Pause")
+        elif state == "paused":
+            self._set_enabled(self.b_play, True, "▶  Resume")
+        elif has_work:
+            self._set_enabled(self.b_play, True, "▶  Play")
+        else:
+            self._set_enabled(self.b_play, False, "▶  Play")
+
+        self._set_enabled(self.b_skip, active, "⏭  Skip")
+        self._set_enabled(self.b_repeat, can_replay, "⏮  Repeat")
+
+        if active:
+            self._set_enabled(self.b_stop, True, "⏹  Stop")
+        elif can_replay:
+            self._set_enabled(self.b_stop, True, "⟳  Restart")
+        else:
+            self._set_enabled(self.b_stop, False, "⟳  Restart")
+
+    # ─── highlight ticker ──────────────────────────────────────────────────────
+
+    def _tick(self):
+        v = self.view.get(self.selected)
+        s = self.sessions.get(self.selected, {})
+        if v and v.get("t0") is not None and v.get("words") \
+                and s.get("state") == "playing":
+            elapsed = (time.monotonic() - v["t0"] - v["pause_accum"]) * 1000.0
+            self._apply_highlight(v, elapsed)
+        self.root.after(33, self._tick)
+
+    def _apply_highlight(self, v, elapsed):
+        active = -1
+        for i, wd in enumerate(v["words"]):
+            if wd["t"] <= elapsed:
+                active = i
+            else:
+                break
+        w = self.text
+        w.tag_remove("hl", "1.0", tk.END)
+        spans = v["spans"]
+        if active < 0 or active >= len(spans) or not spans[active]:
+            return
+        span = spans[active]
+        start = f"1.0+{span[0]}c"
+        end = f"1.0+{span[1]}c"
+        try:
+            w.tag_add("spoken", "1.0", start)
+            w.tag_add("hl", start, end)
+            w.see(start)
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _map_spans(text, words):
@@ -245,7 +448,7 @@ class SpeakUI:
                 continue
             pos = text.find(tok, idx)
             if pos < 0:
-                pos = text.find(tok)        # retry from the front
+                pos = text.find(tok)
             if pos < 0:
                 spans.append(None)
             else:
@@ -253,52 +456,13 @@ class SpeakUI:
                 idx = pos + len(tok)
         return spans
 
-    def _on_tab_change(self, _evt):
-        try:
-            frame = self.nb.nametowidget(self.nb.select())
-        except (tk.TclError, KeyError):
-            return
-        for sid, tab in self.tabs.items():
-            if tab["frame"] is frame:
-                self.send("focus", sid)
-                break
-
-    # ─── highlight ticker ──────────────────────────────────────────────────────
-
-    def _tick(self):
-        if self.cur_sid and self.t0 is not None and self.cur_words and not self.paused:
-            tab = self.tabs.get(self.cur_sid)
-            if tab:
-                elapsed = (time.monotonic() - self.t0 - self.pause_accum) * 1000.0
-                self._apply_highlight(tab["text"], elapsed)
-        self.root.after(33, self._tick)
-
-    def _apply_highlight(self, w, elapsed):
-        # find the last word whose start time has passed
-        active = -1
-        for i, wd in enumerate(self.cur_words):
-            if wd["t"] <= elapsed:
-                active = i
-            else:
-                break
-        w.tag_remove("hl", "1.0", tk.END)
-        if active < 0 or active >= len(self.cur_spans):
-            return
-        span = self.cur_spans[active]
-        if not span:
-            return
-        start = f"1.0+{span[0]}c"
-        end = f"1.0+{span[1]}c"
-        try:
-            w.tag_add("spoken", "1.0", start)
-            w.tag_add("hl", start, end)
-            w.see(start)
-        except tk.TclError:
-            pass
-
 
 def main():
     root = tk.Tk()
+    try:
+        ttk.Style().theme_use("clam")
+    except tk.TclError:
+        pass
     SpeakUI(root)
     root.mainloop()
 
