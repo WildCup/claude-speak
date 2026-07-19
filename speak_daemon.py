@@ -172,10 +172,15 @@ class Session:
         self.pending_since = 0.0         # when this session first had work waiting
         self.playing_msg_id = None       # msg_id of the message on the speaker now
         self.played = False              # has this session ever spoken a chunk?
-        self.state = "idle"              # idle | playing | paused | ended
+        self.disabled = False            # muted for ALL future output until re-enabled
+        self.order_seq = 0               # stable tab order (discovery order)
+        self.state = "idle"              # idle | playing | paused | ended | disabled
+        self.adhoc = False               # ad-hoc tab (piped text), not a jsonl file
+        self.voice = None                # per-session voice override
 
         # current message, for paragraph navigation (Repeat) and whole (Restart)
         self.msg_chunks = []             # ordered chunk texts of the current message
+        self.msg_clean = []              # same chunks, cleaned — what the UI displays
         self.msg_full = None             # its full text
         self.cur_idx = 0                 # chunk index currently playing / last played
         self.cur_started = 0.0           # monotonic time the current chunk began
@@ -202,6 +207,7 @@ class Daemon:
         self.temp_dir = tempfile.mkdtemp(prefix="claude_speak_")
         self.file_counter = 0
         self.seq_counter = 0
+        self.order_counter = 0          # assigns each session a stable display order
 
         # dedup of spoken message ids (bounded)
         self._spoken = collections.OrderedDict()
@@ -215,6 +221,7 @@ class Daemon:
 
         # sessions keyed by jsonl path
         self.sessions = {}
+        self.closed_paths = set()   # tabs the user closed; never re-register them
         self.focus_sid = None       # tab the UI currently shows (for repeat default)
         self.active_sid = None      # session that currently owns the speaker
 
@@ -306,12 +313,13 @@ class Daemon:
                     "sid": s.sid,
                     "label": s.label,
                     "state": s.state,
+                    "disabled": s.disabled,
                     "can_replay": s.can_replay(),
                     "has_work": s.has_work(),
                     "active": s.sid == self.active_sid,
                     "last_active": s.last_active,
                 }
-                for s in sorted(sessions, key=lambda s: -s.last_active)
+                for s in sorted(sessions, key=lambda s: s.order_seq)   # stable order
             ]
         self.broadcast({"ev": "sessions", "sessions": payload})
 
@@ -346,6 +354,8 @@ class Daemon:
         sid = os.path.splitext(os.path.basename(path))[0]
         label = self._label_for(path)
         sess = Session(sid, label, path)
+        self.order_counter += 1
+        sess.order_seq = self.order_counter
         try:
             sess.file_pos = os.path.getsize(path)
             sess.identity = os.stat(path).st_ino
@@ -384,7 +394,7 @@ class Daemon:
                     found_new = False
                     for path in self._discover():
                         with self.sessions_lock:
-                            if path not in self.sessions:
+                            if path not in self.sessions and path not in self.closed_paths:
                                 self._register(path)
                                 found_new = True
                     changed_prune = self._prune()
@@ -412,6 +422,8 @@ class Daemon:
         removed = False
         with self.play_lock:
             for path, sess in list(self.sessions.items()):
+                if sess.adhoc:
+                    continue        # ad-hoc tabs live until closed by hand
                 gone = False
                 stale = False
                 try:
@@ -419,7 +431,7 @@ class Daemon:
                 except OSError:
                     gone = True
                 busy = (sess.has_work() or sess.state in ("playing", "paused")
-                        or sess.sid == self.active_sid)
+                        or sess.disabled or sess.sid == self.active_sid)
                 # a deleted file is definitely dead — prune even if it's the focus;
                 # a merely-quiet (stale) file stays if the UI is focused on it.
                 if not gone and sess.sid == self.focus_sid:
@@ -434,6 +446,8 @@ class Daemon:
 
     def _tail(self, sess):
         """Read new lines from one session file. Returns True if it became active."""
+        if sess.adhoc:
+            return False            # no file behind it; its text arrives over the socket
         try:
             size = os.path.getsize(sess.path)
             ident = os.stat(sess.path).st_ino
@@ -526,11 +540,17 @@ class Daemon:
 
     def _enqueue_message(self, sess, msg_id, full_text):
         """Split a full message into chunks and hand them to the synth worker."""
+        if sess.disabled:
+            return                      # session is muted for all output until enabled
         chunks = cc_speak.extract_speakable_chunks(full_text)
         if not chunks:
             return
         with self.play_lock:
-            sess.msg_chunks = chunks       # remembered for Repeat / Restart
+            sess.msg_chunks = chunks       # remembered for Repeat / Previous / Restart
+            # the UI shows these while audio for a seek target is still synthesizing,
+            # so they must match what _synth_worker will eventually speak
+            sess.msg_clean = [cc_speak.clean_text(c, skip_code=True, skip_paths=True)
+                              for c in chunks]
             sess.msg_full = full_text
         self._enqueue_chunks(sess, msg_id, chunks, full_text, 0)
 
@@ -603,6 +623,8 @@ class Daemon:
         return words
 
     def _voice_for(self, sess):
+        if sess and sess.voice:
+            return sess.voice
         if sess:
             vf = os.path.join(sess.config_dir, "speech-voice")
             if os.path.exists(vf):
@@ -643,16 +665,20 @@ class Daemon:
 
         if self.active_sid:
             s = by_sid.get(self.active_sid)
-            # a paused session with a chunk in hand keeps holding the speaker
-            if s and (s.cur is not None or s.q or s.inflight > 0):
+            # keep the speaker only while the active session is live and unblocked;
+            # a paused or disabled session RELEASES it so other tabs can play.
+            if s and not s.paused and not s.disabled \
+                    and (s.cur is not None or s.q or s.inflight > 0):
                 return s
-            if s is not None and s.state == "playing":
+            if s is not None and s.state == "playing" \
+                    and not (s.cur is not None or s.q or s.inflight > 0):
                 self._set_state(s, "ended")     # drained: nothing left to say
             self.active_sid = None
 
-        # speaker is free: auto-play the session that has waited longest
+        # speaker is free: auto-play the non-paused, non-disabled session that has
+        # waited longest
         cand = [s for s in sessions
-                if not s.paused and (s.cur is not None or s.q)]
+                if not s.paused and not s.disabled and (s.cur is not None or s.q)]
         if not cand:
             return None
         cand.sort(key=lambda s: s.pending_since)
@@ -725,6 +751,7 @@ class Daemon:
             "idx": item.idx,
             "text": item.text,
             "words": item.words,
+            "chunks": list(sess.msg_clean),   # lets the UI jump paragraphs instantly
             "epoch_ms": now_ms(),
         })
 
@@ -849,6 +876,39 @@ class Daemon:
                 self.active_sid = None
             self._set_state(sess, "ended" if sess.can_replay() else "idle")
 
+    def cmd_disable(self, sid=None):
+        """Mute a session for ALL future output: stop it now and refuse new messages
+        until it is enabled again."""
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=True)
+            if not sess:
+                return
+            sess.gen_token += 1             # invalidate this session's in-flight synth
+            if sess.cur is not None:
+                self._mark_cancelled(sess.cur.msg_id)
+                self._safe_remove(sess.cur.path)
+            self._drain_session(sess)
+            self._kill(sess.proc)
+            sess.cur = None
+            sess.proc = None
+            sess.sig_stopped = False
+            sess.paused = False
+            sess.inflight = 0
+            sess.playing_msg_id = None
+            sess.disabled = True
+            if self.active_sid == sess.sid:
+                self.active_sid = None
+            self._set_state(sess, "disabled")
+
+    def cmd_enable(self, sid=None):
+        """Re-enable a disabled session so future messages speak again."""
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=False)
+            if not sess:
+                return
+            sess.disabled = False
+            self._set_state(sess, "ended" if sess.can_replay() else "idle")
+
     def cmd_stop_all(self):
         """Silence everything queued, across all sessions."""
         with self.play_lock:
@@ -874,40 +934,30 @@ class Daemon:
             self.pending.clear()
         self.emit_sessions()
 
-    # how long into a paragraph a Repeat still counts as "restart this one" before
-    # it instead steps back to the previous paragraph (music-player behaviour)
-    REPEAT_BACK_SEC = 1.8
-
     def cmd_repeat(self, sid=None):
-        """Paragraph navigation: restart the current paragraph, or — if we're already
-        at its start — step back to the previous one, then play forward from there."""
-        with self.play_lock:
-            sess = self._resolve(sid, prefer_active=False)
-            if not sess or not sess.msg_chunks or not sess.played:
-                return
-            playing = (sess.cur is not None and sess.proc is not None
-                       and not sess.paused)
-            elapsed = time.monotonic() - sess.cur_started
-            if playing and elapsed > self.REPEAT_BACK_SEC:
-                target = sess.cur_idx           # far enough in: restart this paragraph
-            else:
-                target = sess.cur_idx - 1        # at the start: go to the previous one
-            target = max(0, min(target, len(sess.msg_chunks) - 1))
-            chunks, full = sess.msg_chunks, sess.msg_full
-            self._clear_for_seek(sess)
-            msg_id = "_nav_%d" % (self.seq_counter + 1)
-        self._enqueue_chunks(sess, msg_id, chunks, full, target)
+        """Replay the current paragraph from its start, then continue forward."""
+        self._seek(sid, lambda sess: sess.cur_idx)
+
+    def cmd_prev(self, sid=None):
+        """Step back exactly one paragraph, then continue forward from there."""
+        self._seek(sid, lambda sess: sess.cur_idx - 1)
 
     def cmd_restart(self, sid=None):
         """Re-speak the whole current message from the beginning."""
+        self._seek(sid, lambda sess: 0)
+
+    def _seek(self, sid, pick_idx):
+        """Re-queue a session's current message starting at the chosen paragraph."""
         with self.play_lock:
             sess = self._resolve(sid, prefer_active=False)
             if not sess or not sess.msg_chunks or not sess.played:
                 return
+            target = max(0, min(pick_idx(sess), len(sess.msg_chunks) - 1))
             chunks, full = sess.msg_chunks, sess.msg_full
             self._clear_for_seek(sess)
+            sess.cur_idx = target       # so a follow-up Prev steps from the new spot
             msg_id = "_nav_%d" % (self.seq_counter + 1)
-        self._enqueue_chunks(sess, msg_id, chunks, full, 0)
+        self._enqueue_chunks(sess, msg_id, chunks, full, target)
 
     def _clear_for_seek(self, sess):
         """Tear down a session's current playback so it can be re-queued from a
@@ -929,6 +979,50 @@ class Daemon:
 
     def cmd_focus(self, sid):
         self.focus_sid = sid
+
+    def cmd_speak(self, text, voice=None, label=None):
+        """Speak text handed over by a cc-speak invocation (e.g. a clipboard hotkey),
+        under its own tab so it gets the same transport + read-along as a session."""
+        if not text or not text.strip():
+            return
+        label = label or "clipboard"
+        key = "<adhoc>:" + label         # not a real path: the watcher skips it
+        with self.play_lock:
+            sess = self.sessions.get(key)
+            if sess is None:
+                sess = Session("adhoc-" + label, label, key)
+                sess.adhoc = True
+                sess.config_dir = os.path.join(os.path.expanduser("~"), ".claude")
+                self.order_counter += 1
+                sess.order_seq = self.order_counter
+                self.sessions[key] = sess
+            if voice:
+                sess.voice = voice
+            sess.disabled = False
+            sess.last_active = time.time()
+            self.seq_counter += 1
+            msg_id = "_adhoc_%d" % self.seq_counter
+        self._enqueue_message(sess, msg_id, text)
+        self.emit_sessions()
+
+    def cmd_close(self, sid=None):
+        """Close a tab: silence the session and stop tracking it. A file-backed
+        session stays closed for the daemon's lifetime, even if the file grows."""
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=False)
+            if not sess:
+                return
+            self.cmd_stop(sess.sid)
+            for path, s in list(self.sessions.items()):
+                if s.sid == sess.sid:
+                    self.sessions.pop(path, None)
+                    if not s.adhoc:
+                        self.closed_paths.add(path)
+            if self.focus_sid == sess.sid:
+                self.focus_sid = None
+            if self.active_sid == sess.sid:
+                self.active_sid = None
+        self.emit_sessions()
 
     def _drain_session(self, sess):
         """Remove all queued PlayItems for a session and delete their temp files."""
@@ -1017,12 +1111,22 @@ class Daemon:
             self.cmd_stop(sid)
         elif cmd == "stop_all":
             self.cmd_stop_all()
-        elif cmd in ("repeat", "back"):
+        elif cmd == "disable":
+            self.cmd_disable(sid)
+        elif cmd == "enable":
+            self.cmd_enable(sid)
+        elif cmd == "repeat":
             self.cmd_repeat(sid)
+        elif cmd in ("prev", "previous", "back"):
+            self.cmd_prev(sid)
         elif cmd == "restart":
             self.cmd_restart(sid)
         elif cmd == "focus":
             self.cmd_focus(sid)
+        elif cmd == "speak":
+            self.cmd_speak(msg.get("text"), msg.get("voice"), msg.get("label"))
+        elif cmd == "close":
+            self.cmd_close(sid)
         elif cmd == "ping":
             self.emit_sessions()
 

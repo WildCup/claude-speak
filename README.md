@@ -49,3 +49,7 @@ systemctl --user status claude-speak
 
 # UI
 .venv/bin/python speak_ui.py
+
+bash -c "~/code/AI/audio/claude-speak/.venv/bin/python ~/code/AI/audio/claude-speak/speak_ui.py > /dev/null 2>&1 &"
+
+or just search for 'Claude Speak' and run normally as any program

@@ -22,9 +22,11 @@ Real-time mode:
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,8 @@ import time
 import threading
 import queue
 from pathlib import Path
+
+SPEAK_SOCKET = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
 
 # ─── Text Cleaning ────────────────────────────────────────────────────────────
 
@@ -884,6 +888,28 @@ def follow_stdin(speech_queue: SpeechQueue, debounce_ms: int = 2000):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 
+def send_to_daemon(text, voice=None, label=None):
+    """Hand text to a running speak_daemon so it speaks under its own UI tab, with
+    the transport controls and read-along highlighting. False if no daemon is up,
+    in which case the caller should synthesize locally as usual."""
+    if not hasattr(socket, "AF_UNIX") or not os.path.exists(SPEAK_SOCKET):
+        return False
+    msg = {"cmd": "speak", "text": text}
+    if voice:
+        msg["voice"] = voice
+    if label:
+        msg["label"] = label
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(SPEAK_SOCKET)
+        s.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Read Claude Code output aloud using high-quality TTS.",
@@ -973,6 +999,16 @@ def main():
         action="store_true",
         help="Print cleaned text to stderr instead of speaking",
     )
+    parser.add_argument(
+        "--no-daemon",
+        action="store_true",
+        help="Synthesize locally even if the claude-speak daemon is running",
+    )
+    parser.add_argument(
+        "--ui-label",
+        default="clipboard",
+        help="Tab name to use when handing text to the claude-speak daemon",
+    )
 
     args = parser.parse_args()
 
@@ -1049,6 +1085,15 @@ def main():
         print(text, file=sys.stderr)
         print(f"--- {len(text)} chars, ~{len(text.split())} words ---", file=sys.stderr)
         sys.exit(0)
+
+    # Prefer the daemon: it owns the speaker, so routing through it keeps a hotkey
+    # invocation from talking over a session and gives it a tab in the UI.
+    if not args.output and not args.no_daemon:
+        if send_to_daemon(text, args.voice if args.backend == "edge" else None,
+                          args.ui_label):
+            print(f"Handed to claude-speak daemon (tab: {args.ui_label}).",
+                  file=sys.stderr)
+            return
 
     print(f"Generating speech ({args.backend}, voice: {args.voice}, volume: {args.volume}%)...", file=sys.stderr)
 

@@ -14,7 +14,6 @@ Run alongside the daemon:
 """
 
 import os
-import math
 import json
 import time
 import socket
@@ -45,8 +44,8 @@ class SpeakUI:
     def __init__(self, root):
         self.root = root
         root.title("claude-speak")
-        root.geometry("560x340")
-        root.minsize(420, 240)
+        root.geometry("680x360")
+        root.minsize(560, 240)
         root.configure(bg=BG)
 
         self.events = queue.Queue()
@@ -60,7 +59,8 @@ class SpeakUI:
         self.follow = True              # auto-select the session that starts talking
 
         # per-session read-along state
-        self.view = {}                  # sid -> dict(text,words,spans,t0,pause_accum,pause_started)
+        self.view = {}                  # sid -> dict(text,words,spans,chunks,idx,hl,t0,…)
+        self._rendered = None           # (sid,body,tag) currently in the text widget
 
         self._fonts()
         self._set_icon()
@@ -78,34 +78,17 @@ class SpeakUI:
         self.f_status = tkfont.Font(family="DejaVu Sans", size=9)
 
     def _set_icon(self):
-        """A speaker-with-soundwaves app icon, drawn into a PhotoImage (no assets)."""
-        S = 64
-        cx, cy = 30.0, 32.0
-        rows = []
-        for y in range(S):
-            row = []
-            for x in range(S):
-                c = ACCENT
-                if 14 <= x <= 23 and 25 <= y <= 39:            # speaker back plate
-                    c = "#ffffff"
-                elif 23 < x <= 33:                              # speaker cone
-                    hh = 6 + (x - 23) * 0.9
-                    if cy - hh <= y <= cy + hh:
-                        c = "#ffffff"
-                else:                                           # two sound-wave arcs
-                    d = math.hypot(x - 24, y - cy)
-                    if x >= 35 and abs(y - cy) <= (x - 26) * 0.95 \
-                            and (15.5 <= d <= 17.3 or 21.0 <= d <= 22.8):
-                        c = "#ffffff"
-                row.append(c)
-            rows.append("{" + " ".join(row) + "}")
-        try:
-            img = tk.PhotoImage(width=S, height=S)
-            img.put(" ".join(rows))
-            self.root.iconphoto(True, img)
-            self._icon = img            # keep a ref so it isn't garbage-collected
-        except tk.TclError:
-            pass
+        """Set the window icon from the generated PNG (falls back silently)."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        for path in (os.path.join(here, "claude-speak.png"),
+                     os.path.expanduser("~/.local/share/icons/claude-speak.png")):
+            if os.path.exists(path):
+                try:
+                    self._icon = tk.PhotoImage(file=path)   # keep ref (no GC)
+                    self.root.iconphoto(True, self._icon)
+                    return
+                except tk.TclError:
+                    continue
 
     # ─── widgets ────────────────────────────────────────────────────────────────
 
@@ -133,10 +116,12 @@ class SpeakUI:
         # transport for the selected session
         bar = tk.Frame(self.root, bg=BG)
         bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(6, 6))
-        self.b_repeat = self._tbtn(bar, "⏮  Repeat", lambda: self.send("repeat", self.selected))
-        self.b_play   = self._tbtn(bar, "⏸  Pause", self._toggle)
-        self.b_skip   = self._tbtn(bar, "⏭  Skip", lambda: self.send("skip", self.selected))
-        self.b_stop   = self._tbtn(bar, "⏹  Stop", self._stop_or_restart)
+        self.b_prev    = self._tbtn(bar, "⏪ Previous", lambda: self._nav("prev"))
+        self.b_repeat  = self._tbtn(bar, "⏮ Repeat", lambda: self._nav("repeat"))
+        self.b_play    = self._tbtn(bar, "⏸ Pause", self._toggle)
+        self.b_skip    = self._tbtn(bar, "⏭ Skip", lambda: self.send("skip", self.selected))
+        self.b_restart = self._tbtn(bar, "↺ Restart", lambda: self._nav("restart"))
+        self.b_disable = self._tbtn(bar, "⊘ Disable", self._toggle_disable)
 
         # middle: reading card (fills whatever is left between top and bottom strips)
         card = tk.Frame(self.root, bg=BORDER)
@@ -153,8 +138,8 @@ class SpeakUI:
 
     def _tbtn(self, parent, text, cmd):
         b = tk.Label(parent, text=text, font=self.f_btn, bg=BTN_BG, fg=INK,
-                     padx=14, pady=7, cursor="hand2")
-        b.pack(side=tk.LEFT, padx=(0, 6))
+                     padx=9, pady=7, cursor="hand2")
+        b.pack(side=tk.LEFT, padx=(0, 5))
         b._cmd = cmd
         b._enabled = True
         self._hover(b, BTN_BG, BTN_HI)
@@ -191,12 +176,13 @@ class SpeakUI:
             label = s.get("label") or sid[:8]
             if counts.get(label, 0) > 1:
                 label = f"{label}·{sid[:4]}"
-            dot = {"playing": "● ", "paused": "❚❚ ", "ended": "", "idle": ""}.get(
-                s.get("state"), "")
+            dot = {"playing": "● ", "paused": "❚❚ ", "disabled": "⊘ ",
+                   "ended": "", "idle": ""}.get(s.get("state"), "")
             pill = tk.Label(self.tabstrip, text=dot + label, font=self.f_pill,
                             padx=12, pady=6, cursor="hand2")
             pill.pack(side=tk.LEFT, padx=(0, 6))
             pill.bind("<Button-1>", lambda e, x=sid: self._select(x, user=True))
+            pill.bind("<Button-3>", lambda e, x=sid: self._tab_menu(e, x))
             self.pills[sid] = pill
         self._paint_pills()
 
@@ -209,6 +195,18 @@ class SpeakUI:
             else:
                 pill.configure(bg=PILL_BG, fg=INK)
                 self._hover(pill, PILL_BG, PILL_HI)
+
+    def _tab_menu(self, event, sid):
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Close tab", command=lambda: self._close(sid))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def _close(self, sid):
+        self.send("close", sid)
+        self.view.pop(sid, None)
 
     def _select(self, sid, user=False):
         if sid not in self.sessions:
@@ -275,12 +273,31 @@ class SpeakUI:
         else:
             self.send("resume", self.selected)
 
-    def _stop_or_restart(self):
+    def _nav(self, cmd):
+        """Paragraph navigation. The daemon has to re-synthesize audio (~1s), so we
+        move the reading card to the target paragraph right now — the text is correct
+        immediately and the voice catches up when the 'play' event lands."""
+        sid = self.selected
+        if not sid:
+            return
+        self.send(cmd, sid)
+        v = self.view.get(sid)
+        chunks = (v or {}).get("chunks")
+        if not chunks:
+            return
+        idx = v.get("idx", 0)
+        target = {"repeat": idx, "prev": idx - 1, "restart": 0}[cmd]
+        target = max(0, min(target, len(chunks) - 1))
+        v.update(text=chunks[target], idx=target, words=[],
+                 spans=[], t0=None, pause_accum=0.0, pause_started=None, hl=-1)
+        self._refresh_text()
+
+    def _toggle_disable(self):
         s = self.sessions.get(self.selected, {})
-        if s.get("state") in ("playing", "paused"):
-            self.send("stop", self.selected)
+        if s.get("disabled"):
+            self.send("enable", self.selected)
         else:
-            self.send("restart", self.selected)
+            self.send("disable", self.selected)
 
     # ─── event handling (main thread) ──────────────────────────────────────────
 
@@ -331,6 +348,7 @@ class SpeakUI:
         self.view[sid] = {
             "text": text, "words": words, "spans": self._map_spans(text, words),
             "t0": time.monotonic(), "pause_accum": 0.0, "pause_started": None,
+            "chunks": ev.get("chunks") or [], "idx": ev.get("idx", 0), "hl": -1,
         }
         if self.follow or sid == self.selected or self.selected is None:
             self.selected = sid
@@ -345,8 +363,9 @@ class SpeakUI:
         v = self.view.get(sid)
         if v:
             v["t0"] = None
-        if sid == self.selected:
-            self.text.tag_remove("hl", "1.0", tk.END)
+            v["hl"] = len(v.get("spans") or [])     # past the last word: all spoken
+        if sid == self.selected and v:
+            self._repaint(v)
 
     def _on_pause(self, sid):
         v = self.view.get(sid)
@@ -362,46 +381,66 @@ class SpeakUI:
     # ─── reading card ───────────────────────────────────────────────────────────
 
     def _refresh_text(self):
+        """Render the selected session's paragraph. Re-inserting the text drops every
+        tag with it, so unchanged content is left alone — that is what keeps the
+        highlight and the dimmed already-spoken words on screen while paused."""
+        v = self.view.get(self.selected)
+        if v and v.get("text"):
+            body, tag = v["text"], None
+        else:
+            s = self.sessions.get(self.selected, {})
+            body = {"ended": "— finished. Repeat to hear it again. —",
+                    "paused": "— paused —",
+                    "disabled": "— disabled. Enable to hear this session again. —"}.get(
+                        s.get("state"), "— waiting for output… —")
+            tag = "idle"
+
+        key = (self.selected, body, tag)
+        if key == self._rendered:
+            return
+        self._rendered = key
+
         w = self.text
         w.config(state=tk.NORMAL)
         w.delete("1.0", tk.END)
-        v = self.view.get(self.selected)
-        if v and v.get("text"):
-            w.insert("1.0", v["text"])
-        else:
-            s = self.sessions.get(self.selected, {})
-            hint = {"ended": "— finished. Repeat or Restart to hear it again. —",
-                    "paused": "— paused —"}.get(s.get("state"),
-                                                "— waiting for output… —")
-            w.insert("1.0", hint, "idle")
+        w.insert("1.0", body, () if tag is None else tag)
         w.config(state=tk.DISABLED)
+        if tag is None and v:
+            self._repaint(v)
 
     def _refresh_buttons(self):
         s = self.sessions.get(self.selected, {}) if self.selected else {}
         state = s.get("state", "idle")
+        disabled = s.get("disabled", False)
         can_replay = s.get("can_replay", False)
         has_work = s.get("has_work", False)
         active = state in ("playing", "paused")
 
+        if disabled:
+            # a disabled session is fully silenced; only Enable is actionable
+            self._set_enabled(self.b_play, False, "▶ Play")
+            self._set_enabled(self.b_skip, False, "⏭ Skip")
+            self._set_enabled(self.b_prev, False, "⏪ Previous")
+            self._set_enabled(self.b_repeat, False, "⏮ Repeat")
+            self._set_enabled(self.b_restart, False, "↺ Restart")
+            self._set_enabled(self.b_disable, True, "✓ Enable")
+            return
+
         # Pause / Resume / Play
         if state == "playing":
-            self._set_enabled(self.b_play, True, "⏸  Pause")
+            self._set_enabled(self.b_play, True, "⏸ Pause")
         elif state == "paused":
-            self._set_enabled(self.b_play, True, "▶  Resume")
+            self._set_enabled(self.b_play, True, "▶ Resume")
         elif has_work:
-            self._set_enabled(self.b_play, True, "▶  Play")
+            self._set_enabled(self.b_play, True, "▶ Play")
         else:
-            self._set_enabled(self.b_play, False, "▶  Play")
+            self._set_enabled(self.b_play, False, "▶ Play")
 
-        self._set_enabled(self.b_skip, active, "⏭  Skip")
-        self._set_enabled(self.b_repeat, can_replay, "⏮  Repeat")
-
-        if active:
-            self._set_enabled(self.b_stop, True, "⏹  Stop")
-        elif can_replay:
-            self._set_enabled(self.b_stop, True, "⟳  Restart")
-        else:
-            self._set_enabled(self.b_stop, False, "⟳  Restart")
+        self._set_enabled(self.b_skip, active, "⏭ Skip")
+        self._set_enabled(self.b_prev, can_replay, "⏪ Previous")
+        self._set_enabled(self.b_repeat, can_replay, "⏮ Repeat")
+        self._set_enabled(self.b_restart, can_replay, "↺ Restart")
+        self._set_enabled(self.b_disable, True, "⊘ Disable")
 
     # ─── highlight ticker ──────────────────────────────────────────────────────
 
@@ -421,18 +460,34 @@ class SpeakUI:
                 active = i
             else:
                 break
+        if active == v.get("hl"):
+            return
+        v["hl"] = active
+        self._repaint(v, scroll=True)
+
+    def _repaint(self, v, scroll=False):
+        """Paint spoken/highlight tags for v's remembered word position. Safe to call
+        any time — it derives everything from v, so it survives a re-render."""
         w = self.text
         w.tag_remove("hl", "1.0", tk.END)
-        spans = v["spans"]
-        if active < 0 or active >= len(spans) or not spans[active]:
+        w.tag_remove("spoken", "1.0", tk.END)
+        i = v.get("hl", -1)
+        spans = v.get("spans") or []
+        if i < 0:
             return
-        span = spans[active]
-        start = f"1.0+{span[0]}c"
-        end = f"1.0+{span[1]}c"
+        if i >= len(spans):
+            w.tag_add("spoken", "1.0", tk.END)      # paragraph finished
+            return
+        while i >= 0 and not spans[i]:              # unmapped token: use the last known
+            i -= 1
+        if i < 0:
+            return
+        start, end = f"1.0+{spans[i][0]}c", f"1.0+{spans[i][1]}c"
         try:
             w.tag_add("spoken", "1.0", start)
             w.tag_add("hl", start, end)
-            w.see(start)
+            if scroll:
+                w.see(start)
         except tk.TclError:
             pass
 
@@ -458,7 +513,9 @@ class SpeakUI:
 
 
 def main():
-    root = tk.Tk()
+    # className becomes the window's WM_CLASS, which GNOME matches against the
+    # .desktop's StartupWMClass to pick the dock/titlebar icon.
+    root = tk.Tk(className="claude-speak")
     try:
         ttk.Style().theme_use("clam")
     except tk.TclError:
