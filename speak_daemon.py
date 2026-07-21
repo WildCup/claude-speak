@@ -9,7 +9,7 @@ Architecture:
     synth worker     -> Utterance -> edge-tts mp3 + WordBoundary timings -> PlayItem,
                         routed into the owning session's own play queue
     scheduler thread -> plays one session at a time (the "active" session), with
-                        per-session pause (SIGSTOP/SIGCONT), skip, stop, repeat
+                        per-session pause, skip, stop, repeat
     socket server    -> accepts UI/CLI clients, dispatches commands, broadcasts events
 
 Playback model (one speaker, many sessions):
@@ -33,7 +33,9 @@ import atexit
 import asyncio
 import hashlib
 import tempfile
+import itertools
 import threading
+import subprocess
 import collections
 from datetime import datetime, timezone
 
@@ -164,8 +166,8 @@ class Session:
         # ─ per-session playback state (guarded by Daemon.play_lock) ─
         self.q = collections.deque()     # PlayItems waiting to play
         self.cur = None                  # PlayItem currently on the speaker
-        self.proc = None                 # its ffplay process
-        self.sig_stopped = False         # is proc currently SIGSTOP'd?
+        self.proc = None                 # its player process (_MpvProc / _SignalProc)
+        self.player_paused = False       # is the player itself currently paused?
         self.paused = False              # user paused this session
         self.inflight = 0                # utterances queued to synth, not yet in q
         self.gen_token = 0               # bumped by this session's stop/replay
@@ -699,7 +701,7 @@ class Daemon:
                     return
                 sess.cur = item
                 sess.proc = None
-                sess.sig_stopped = False
+                sess.player_paused = False
             else:
                 # nothing left to play for this session right now
                 if sess.inflight == 0 and sess.state == "playing":
@@ -718,20 +720,21 @@ class Daemon:
         # proc exists: manage pause/resume and completion
         rc = sess.proc.poll()
         if rc is None:
-            if sess.paused and not sess.sig_stopped:
-                self._signal(sess.proc, signal.SIGSTOP)
-                sess.sig_stopped = True
-            elif not sess.paused and sess.sig_stopped:
-                self._signal(sess.proc, signal.SIGCONT)
-                sess.sig_stopped = False
+            if sess.paused and not sess.player_paused:
+                sess.proc.pause()
+                sess.player_paused = True
+            elif not sess.paused and sess.player_paused:
+                sess.proc.resume()
+                sess.player_paused = False
             return
 
         # chunk finished
         self._safe_remove(sess.cur.path)
+        sess.proc.kill()                # already exited; this reaps its IPC socket
         self.broadcast({"ev": "end", "sid": sess.sid, "seq": sess.cur.seq})
         sess.cur = None
         sess.proc = None
-        sess.sig_stopped = False
+        sess.player_paused = False
 
     def _start_proc(self, sess):
         item = sess.cur
@@ -739,9 +742,9 @@ class Daemon:
         sess.cur_idx = item.idx                  # where we are in the message
         sess.cur_started = time.monotonic()
         sess.played = True
-        proc = self._spawn_ffplay(item.path)
+        proc = self._spawn_player(item.path)
         sess.proc = proc
-        sess.sig_stopped = False
+        sess.player_paused = False
         self._set_state(sess, "playing")
         self.broadcast({
             "ev": "play",
@@ -755,40 +758,39 @@ class Daemon:
             "epoch_ms": now_ms(),
         })
 
-    def _spawn_ffplay(self, path):
+    def _spawn_player(self, path):
         import shutil
-        ffplay = shutil.which("ffplay")
-        if not ffplay:
-            # no controllable player: fall back to a blocking play (rare)
-            threading.Thread(target=cc_speak.play_audio, args=(path,),
-                             daemon=True).start()
-            return _DummyProc()
-        import subprocess
-        try:
-            return subprocess.Popen(
-                [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            return _DummyProc()
 
-    @staticmethod
-    def _signal(proc, sig):
-        try:
-            proc.send_signal(sig)
-        except (OSError, ValueError):
-            pass
+        mpv = shutil.which("mpv")
+        if mpv:
+            sock = _ipc_socket_path()
+            try:
+                proc = subprocess.Popen(
+                    [mpv, "--no-video", "--no-terminal", "--really-quiet",
+                     f"--input-ipc-server={sock}", path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return _MpvProc(proc, sock)
+            except OSError:
+                pass
+
+        ffplay = shutil.which("ffplay")
+        if ffplay:
+            try:
+                return _SignalProc(subprocess.Popen(
+                    [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            except OSError:
+                pass
+
+        # no controllable player: fall back to a blocking play (rare)
+        threading.Thread(target=cc_speak.play_audio, args=(path,),
+                         daemon=True).start()
+        return _DummyProc()
 
     def _kill(self, proc):
         if proc is None:
             return
-        try:
-            proc.send_signal(signal.SIGCONT)    # in case it was paused
-        except (OSError, ValueError):
-            pass
-        try:
-            proc.kill()
-        except (OSError, ValueError):
-            pass
+        proc.kill()
 
     @staticmethod
     def _safe_remove(path):
@@ -806,9 +808,9 @@ class Daemon:
             if not sess:
                 return
             sess.paused = True
-            if sess.proc is not None and not sess.sig_stopped:
-                self._signal(sess.proc, signal.SIGSTOP)
-                sess.sig_stopped = True
+            if sess.proc is not None and not sess.player_paused:
+                sess.proc.pause()
+                sess.player_paused = True
             self._set_state(sess, "paused")
         self.broadcast({"ev": "pause", "sid": sess.sid})
 
@@ -821,16 +823,16 @@ class Daemon:
             # switching speaker: pause whoever holds it now
             if self.active_sid and self.active_sid != sess.sid:
                 other = self._session_by_sid(self.active_sid)
-                if other and other.proc is not None and not other.sig_stopped:
+                if other and other.proc is not None and not other.player_paused:
                     other.paused = True
-                    self._signal(other.proc, signal.SIGSTOP)
-                    other.sig_stopped = True
+                    other.proc.pause()
+                    other.player_paused = True
                     self._set_state(other, "paused")
             self.active_sid = sess.sid
             sess.paused = False
-            if sess.proc is not None and sess.sig_stopped:
-                self._signal(sess.proc, signal.SIGCONT)
-                sess.sig_stopped = False
+            if sess.proc is not None and sess.player_paused:
+                sess.proc.resume()
+                sess.player_paused = False
             if sess.cur is not None or sess.q or sess.inflight > 0:
                 self._set_state(sess, "playing")
         self.broadcast({"ev": "resume", "sid": sess.sid})
@@ -865,7 +867,7 @@ class Daemon:
             self._drain_session(sess)
             self._kill(sess.proc)
             sess.proc = None
-            sess.sig_stopped = False
+            sess.player_paused = False
             if sess.cur is not None:
                 self._safe_remove(sess.cur.path)
             sess.cur = None
@@ -891,7 +893,7 @@ class Daemon:
             self._kill(sess.proc)
             sess.cur = None
             sess.proc = None
-            sess.sig_stopped = False
+            sess.player_paused = False
             sess.paused = False
             sess.inflight = 0
             sess.playing_msg_id = None
@@ -924,7 +926,7 @@ class Daemon:
                     self._safe_remove(sess.cur.path)
                 sess.cur = None
                 sess.proc = None
-                sess.sig_stopped = False
+                sess.player_paused = False
                 sess.paused = False
                 sess.inflight = 0
                 sess.playing_msg_id = None
@@ -970,7 +972,7 @@ class Daemon:
         self._kill(sess.proc)
         sess.cur = None
         sess.proc = None
-        sess.sig_stopped = False
+        sess.player_paused = False
         sess.paused = False
         sess.inflight = 0
         sess.playing_msg_id = None
@@ -1137,14 +1139,130 @@ class Daemon:
         self._cleanup()
 
 
+_ipc_counter = itertools.count()
+
+# sockaddr_un.sun_path is 108 bytes; a long TMPDIR would silently break IPC and
+# drop us back to the SIGSTOP path, so fall back to /tmp when it won't fit.
+_SUN_PATH_MAX = 100
+
+
+def _ipc_socket_path():
+    name = f"ccspeak-mpv-{os.getpid()}-{next(_ipc_counter)}.sock"
+    path = os.path.join(tempfile.gettempdir(), name)
+    if len(path.encode()) > _SUN_PATH_MAX:
+        path = os.path.join("/tmp", name)
+    return path
+
+
+class _SignalProc:
+    """A player paused by freezing the process itself.
+
+    SIGSTOP leaves the player's audio stream open but unfed, so the sink keeps
+    pulling and loops whatever stale samples are still in the ring buffer — an
+    audible whine for as long as the pause lasts. Only used when mpv, which can
+    pause its output stream properly, isn't available.
+    """
+
+    def __init__(self, proc):
+        self.proc = proc
+        self.paused = False
+
+    def poll(self):
+        return self.proc.poll()
+
+    def _signal(self, sig):
+        try:
+            self.proc.send_signal(sig)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def pause(self):
+        self.paused = self._signal(signal.SIGSTOP)
+        return self.paused
+
+    def resume(self):
+        self._signal(signal.SIGCONT)
+        self.paused = False
+        return True
+
+    def kill(self):
+        if self.paused:
+            self._signal(signal.SIGCONT)   # a stopped proc can't reap its own SIGKILL
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=1.0)    # reap it; nothing polls this proc again
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+
+
+class _MpvProc(_SignalProc):
+    """mpv driven over a JSON IPC socket.
+
+    Pausing via IPC makes mpv cork its audio stream, so the sink goes idle
+    instead of underrunning on a frozen client. If the socket isn't up yet
+    (pause pressed within a few ms of spawn) we fall back to SIGSTOP, and
+    remember that so resume sends the matching SIGCONT.
+    """
+
+    IPC_WAIT = 0.4          # how long to wait for mpv to create its socket
+
+    def __init__(self, proc, ipc_path):
+        super().__init__(proc)
+        self.ipc_path = ipc_path
+        self.froze = False   # did we fall back to SIGSTOP for this pause?
+
+    def _command(self, *args):
+        """Send one IPC command, waiting briefly for the socket to appear."""
+        deadline = time.monotonic() + self.IPC_WAIT
+        payload = json.dumps({"command": list(args)}).encode() + b"\n"
+        while True:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.2)
+                    s.connect(self.ipc_path)
+                    s.sendall(payload)
+                    return True
+            except (OSError, socket.timeout):
+                if time.monotonic() >= deadline or self.proc.poll() is not None:
+                    return False
+                time.sleep(0.02)
+
+    def pause(self):
+        if self._command("set_property", "pause", True):
+            self.froze = False
+        else:
+            self.froze = self._signal(signal.SIGSTOP)
+        self.paused = True
+        return True
+
+    def resume(self):
+        if self.froze:
+            self._signal(signal.SIGCONT)
+            self.froze = False
+        self._command("set_property", "pause", False)
+        self.paused = False
+        return True
+
+    def kill(self):
+        super().kill()
+        try:
+            os.unlink(self.ipc_path)
+        except OSError:
+            pass
+
+
 class _DummyProc:
     """Stand-in when no controllable player exists; behaves as an instantly-done proc."""
 
     def poll(self):
         return 0
 
-    def send_signal(self, sig):
-        pass
+    def pause(self):
+        return True
+
+    def resume(self):
+        return True
 
     def kill(self):
         pass
