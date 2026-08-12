@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Speak
+Comment=Voice output for Claude Code
+Exec=/home/puffin/code/AI/audio/claude-speak/.venv/bin/python /home/puffin/code/AI/audio/claude-speak/speak_ui.py
+Icon=/home/puffin/code/AI/audio/claude-speak/claude-speak.png
+StartupWMClass=claude-speak
+Terminal=false
+Categories=Utility;AudioVideo;

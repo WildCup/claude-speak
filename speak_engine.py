@@ -9,7 +9,7 @@ _chunk_text / play_audio from here.
 As a script, it reads text (argument, file or stdin) and hands it to the running
 daemon so it gets its own UI tab and transport controls:
 
-    echo "$(xsel -o)" | python speak_engine.py -v en-US-AndrewMultilingualNeural
+    echo "$(xsel -o)" | python speak_engine.py
 
 If the daemon isn't up it synthesizes and plays the text itself.
 """
@@ -26,6 +26,9 @@ import sys
 import tempfile
 
 SPEAK_SOCKET = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
+
+# Only used when no daemon is running; otherwise the daemon's own setting wins.
+DEFAULT_VOICE = "en-US-AndrewMultilingualNeural"
 
 # ─── Text Cleaning ────────────────────────────────────────────────────────────
 
@@ -436,15 +439,13 @@ def extract_speakable_chunks(text: str) -> list:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 
-def send_to_daemon(text, voice=None, label=None):
+def send_to_daemon(text, label=None):
     """Hand text to a running speak_daemon so it speaks under its own UI tab, with
     the transport controls and read-along highlighting. False if no daemon is up,
     in which case the caller should synthesize locally as usual."""
     if not hasattr(socket, "AF_UNIX") or not os.path.exists(SPEAK_SOCKET):
         return False
     msg = {"cmd": "speak", "text": text}
-    if voice:
-        msg["voice"] = voice
     if label:
         msg["label"] = label
     try:
@@ -463,8 +464,6 @@ def main():
         description="Clean text and speak it through the claude-speak daemon.")
     ap.add_argument("text", nargs="?", help="Text to read (default: stdin)")
     ap.add_argument("--file", "-f", help="Read the text from this file instead")
-    ap.add_argument("--voice", "-v", default=None,
-                    help="Voice override (default: whatever the daemon is set to)")
     ap.add_argument("--rate", "-r", default="+10%",
                     help="Rate for local playback when no daemon is running")
     ap.add_argument("--volume", "-V", type=int, default=100)
@@ -497,7 +496,7 @@ def main():
         print(text)
         return
 
-    if send_to_daemon(text, args.voice, args.label):
+    if send_to_daemon(text, args.label):
         return
 
     # No daemon: synthesize and play it here so the hotkey still does something.
@@ -505,8 +504,7 @@ def main():
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tmp.close()
     try:
-        voice = args.voice or "en-US-AndrewMultilingualNeural"
-        if tts_edge(text, voice, args.rate, tmp.name, volume=args.volume):
+        if tts_edge(text, DEFAULT_VOICE, args.rate, tmp.name, volume=args.volume):
             play_audio(tmp.name, volume=args.volume)
     finally:
         try:

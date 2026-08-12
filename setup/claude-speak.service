@@ -1,0 +1,13 @@
+[Unit]
+Description=Claude Speak TTS Monitor
+After=default.target
+
+[Service]
+ExecStart=%h/code/AI/audio/claude-speak/.venv/bin/python %h/code/AI/audio/claude-speak/speak_daemon.py
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+
+[Install]
+WantedBy=default.target

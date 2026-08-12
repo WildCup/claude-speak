@@ -46,7 +46,6 @@ import edge_tts      # noqa: E402  (used directly for WordBoundary timings)
 CLAUDE_PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.json")
-LEGACY_VOICE_PATH = os.path.join(os.path.expanduser("~"), ".claude", "speech-voice")
 
 DEFAULT_CONFIG = {
     "voice": "en-US-AndrewMultilingualNeural",
@@ -92,7 +91,7 @@ def normalize_rate(r):
 
 
 def load_config():
-    """Read the saved config, seeding it from the legacy speech-voice file once."""
+    """Read the saved config, falling back to defaults for anything missing."""
     cfg = dict(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH) as f:
@@ -100,14 +99,7 @@ def load_config():
         if isinstance(saved, dict):
             cfg.update({k: saved[k] for k in DEFAULT_CONFIG if k in saved})
     except (OSError, ValueError):
-        # no config yet: carry over the voice the old plain-text file selected
-        try:
-            with open(LEGACY_VOICE_PATH) as f:
-                v = f.read().strip()
-            if v:
-                cfg["voice"] = v
-        except OSError:
-            pass
+        pass
     cfg["rate"] = normalize_rate(cfg.get("rate"))
     cfg["volume"] = clamp_volume(cfg.get("volume"))
     if not isinstance(cfg.get("voice"), str) or not cfg["voice"].strip():
@@ -258,7 +250,6 @@ class Session:
         self.sid = sid              # stable id (sessionId or file stem)
         self.label = label          # human label (basename of cwd)
         self.path = path            # jsonl path
-        self.config_dir = os.path.dirname(path)
         self.file_pos = 0
         self.identity = None        # inode, to detect file replacement
         self.last_active = 0.0
@@ -278,7 +269,6 @@ class Session:
         self.order_seq = 0               # stable tab order (discovery order)
         self.state = "idle"              # idle | playing | paused | ended | disabled
         self.adhoc = False               # ad-hoc tab (piped text), not a jsonl file
-        self.voice = None                # per-session voice override
 
         # current message, for paragraph navigation (Repeat) and whole (Restart)
         self.msg_chunks = []             # ordered chunk texts of the current message
@@ -465,15 +455,6 @@ class Daemon:
                         s.proc.set_volume(self.volume)
         save_config(self.current_config())
         self.emit_config()
-
-    def cmd_set_session_voice(self, sid, voice):
-        """Override the voice for one tab; empty/None reverts it to the global."""
-        sess = self._session_by_sid(sid)
-        if sess is None:
-            return
-        with self.play_lock:
-            sess.voice = voice.strip() if isinstance(voice, str) and voice.strip() else None
-        self.broadcast({"ev": "session_voice", "sid": sid, "voice": sess.voice})
 
     def cmd_voices(self):
         """Send the edge-tts catalogue (fetched once, then cached)."""
@@ -814,8 +795,7 @@ class Daemon:
                     continue
                 self.file_counter += 1
                 out = os.path.join(self.temp_dir, f"s{self.file_counter}.mp3")
-                voice = self._voice_for(sess)
-                out, words = self._render(loop, cleaned, voice, out)
+                out, words = self._render(loop, cleaned, self.voice, out)
                 if self._is_cancelled(u):       # stopped while we were synthesizing
                     self._safe_remove(out)
                     continue
@@ -901,20 +881,6 @@ class Daemon:
                     })
         return words
 
-    def _voice_for(self, sess):
-        if sess and sess.voice:
-            return sess.voice
-        if sess:
-            vf = os.path.join(sess.config_dir, "speech-voice")
-            if os.path.exists(vf):
-                try:
-                    with open(vf) as f:
-                        v = f.read().strip()
-                        if v:
-                            return v
-                except OSError:
-                    pass
-        return self.voice       # global default, from the saved config
 
     # ─── scheduler: plays one session (the active one) at a time ────────────────
 
@@ -1250,9 +1216,9 @@ class Daemon:
     def cmd_focus(self, sid):
         self.focus_sid = sid
 
-    def cmd_speak(self, text, voice=None, label=None):
-        """Speak text handed over by a cc-speak invocation (e.g. a clipboard hotkey),
-        under its own tab so it gets the same transport + read-along as a session."""
+    def cmd_speak(self, text, label=None):
+        """Speak text handed over by speak_engine (the clipboard hotkey), under its
+        own tab so it gets the same transport + read-along as a session."""
         if not text or not text.strip():
             return
         label = label or "clipboard"
@@ -1262,12 +1228,9 @@ class Daemon:
             if sess is None:
                 sess = Session("adhoc-" + label, label, key)
                 sess.adhoc = True
-                sess.config_dir = os.path.join(os.path.expanduser("~"), ".claude")
                 self.order_counter += 1
                 sess.order_seq = self.order_counter
                 self.sessions[key] = sess
-            if voice:
-                sess.voice = voice
             sess.disabled = False
             sess.last_active = time.time()
             self.seq_counter += 1
@@ -1395,7 +1358,7 @@ class Daemon:
         elif cmd == "focus":
             self.cmd_focus(sid)
         elif cmd == "speak":
-            self.cmd_speak(msg.get("text"), msg.get("voice"), msg.get("label"))
+            self.cmd_speak(msg.get("text"), msg.get("label"))
         elif cmd == "close":
             self.cmd_close(sid)
         elif cmd == "ping":
@@ -1404,8 +1367,6 @@ class Daemon:
             self.emit_config()
         elif cmd == "set_config":
             self.cmd_set_config(msg)
-        elif cmd == "set_session_voice":
-            self.cmd_set_session_voice(sid, msg.get("voice"))
         elif cmd == "voices":
             self.cmd_voices()
         elif cmd == "preview":
