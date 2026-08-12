@@ -27,6 +27,7 @@ import json
 import glob
 import time
 import queue
+import shutil
 import signal
 import socket
 import atexit
@@ -59,9 +60,52 @@ POLL_SEC = 1.0
 RESCAN_SEC = 3.0
 TICK_SEC = 0.04
 
+# edge-tts is a network call and rejects very long inputs. Retry transient
+# failures, then fall back to a local voice so a message is never silently lost.
+MAX_SYNTH_CHARS = 3000
+SYNTH_ATTEMPTS = 3
+SYNTH_RETRY_SEC = 0.6
+
 
 def now_ms():
     return time.monotonic() * 1000.0
+
+
+def _hard_split(text, limit):
+    """Split on whitespace so no piece exceeds `limit` chars."""
+    out, cur = [], ""
+    for word in text.split():
+        if cur and len(cur) + 1 + len(word) > limit:
+            out.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}" if cur else word
+        while len(cur) > limit:          # a single token longer than the limit
+            out.append(cur[:limit])
+            cur = cur[limit:]
+    if cur:
+        out.append(cur)
+    return out
+
+
+def cap_chunks(chunks):
+    """Backstop for chunks edge-tts would choke on.
+
+    extract_speakable_chunks already targets ~400-500 chars, but it splits long
+    paragraphs on sentence boundaries only — an unpunctuated wall of text or a
+    huge URL comes back as one oversized chunk and fails synthesis.
+    """
+    out = []
+    for c in chunks:
+        if len(c) <= MAX_SYNTH_CHARS:
+            out.append(c)
+            continue
+        for piece in cc_speak._chunk_text(c, MAX_SYNTH_CHARS):
+            if len(piece) <= MAX_SYNTH_CHARS:
+                out.append(piece)
+            else:
+                out.extend(_hard_split(piece, MAX_SYNTH_CHARS))
+    return out
 
 
 def parse_ts(s):
@@ -255,7 +299,6 @@ class Daemon:
     # ─── helpers ──────────────────────────────────────────────────────────────
 
     def _cleanup(self):
-        import shutil
         try:
             shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception:
@@ -544,7 +587,7 @@ class Daemon:
         """Split a full message into chunks and hand them to the synth worker."""
         if sess.disabled:
             return                      # session is muted for all output until enabled
-        chunks = cc_speak.extract_speakable_chunks(full_text)
+        chunks = cap_chunks(cc_speak.extract_speakable_chunks(full_text))
         if not chunks:
             return
         with self.play_lock:
@@ -586,12 +629,11 @@ class Daemon:
                 self.file_counter += 1
                 out = os.path.join(self.temp_dir, f"s{self.file_counter}.mp3")
                 voice = self._voice_for(sess)
-                words = loop.run_until_complete(
-                    self._synth(cleaned, voice, self.rate, out))
+                out, words = self._render(loop, cleaned, voice, out)
                 if self._is_cancelled(u):       # stopped while we were synthesizing
                     self._safe_remove(out)
                     continue
-                if os.path.exists(out) and os.path.getsize(out) > 0 and sess is not None:
+                if out and sess is not None:
                     item = PlayItem(u.session, u.msg_id, u.seq, cleaned, u.full,
                                     out, words, u.gen, u.idx)
                     with self.play_lock:
@@ -607,6 +649,54 @@ class Daemon:
                 if sess is not None:
                     with self.play_lock:
                         sess.inflight = max(0, sess.inflight - 1)
+
+    def _render(self, loop, text, voice, out_path):
+        """Synthesize `text` to an audio file, returning (path, word_timings).
+
+        edge-tts is a network call, so transient failures are retried before
+        falling back to a local voice — otherwise a dropped request means the
+        message is silently never spoken. Returns (None, []) if nothing rendered.
+        """
+        for attempt in range(SYNTH_ATTEMPTS):
+            if not self.running:
+                return None, []
+            try:
+                words = loop.run_until_complete(
+                    self._synth(text, voice, self.rate, out_path))
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    return out_path, words
+                raise RuntimeError("edge-tts returned no audio")
+            except Exception as e:
+                self._safe_remove(out_path)
+                if attempt == SYNTH_ATTEMPTS - 1:
+                    print(f"synth failed after {SYNTH_ATTEMPTS} attempts: {e}",
+                          file=sys.stderr)
+                else:
+                    time.sleep(SYNTH_RETRY_SEC)
+
+        wav = self._synth_local(text, out_path)
+        if wav:
+            print("edge-tts unavailable; spoke with local fallback voice",
+                  file=sys.stderr)
+            return wav, []       # no timings, so the UI highlights the chunk whole
+        return None, []
+
+    def _synth_local(self, text, out_path):
+        """Render with an offline TTS binary. Returns the wav path, or None."""
+        espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+        if not espeak:
+            return None
+        wav = os.path.splitext(out_path)[0] + ".wav"
+        try:
+            subprocess.run([espeak, "-w", wav, text],
+                           check=True, capture_output=True, timeout=120)
+        except (subprocess.SubprocessError, OSError):
+            self._safe_remove(wav)
+            return None
+        if os.path.exists(wav) and os.path.getsize(wav) > 0:
+            return wav
+        self._safe_remove(wav)
+        return None
 
     async def _synth(self, text, voice, rate, out_path):
         """edge-tts streaming: write audio + collect word timings (ms)."""
@@ -759,8 +849,6 @@ class Daemon:
         })
 
     def _spawn_player(self, path):
-        import shutil
-
         mpv = shutil.which("mpv")
         if mpv:
             sock = _ipc_socket_path()
@@ -1268,6 +1356,23 @@ class _DummyProc:
         pass
 
 
+def _daemon_is_live():
+    """True if another daemon already owns the control socket.
+
+    Probing beats a pid file here: the socket is the resource being contended,
+    so a refused connect proves the file is stale with no pid-reuse ambiguity.
+    """
+    if not os.path.exists(SOCKET_PATH):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(SOCKET_PATH)
+        return True
+    except OSError:
+        return False        # leftover socket file, nobody listening
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Claude Speak daemon (socket-controlled)")
@@ -1275,6 +1380,14 @@ def main():
     ap.add_argument("--rate", "-r", default="+10%")
     ap.add_argument("--debounce", "-d", type=int, default=1500)
     args = ap.parse_args()
+
+    # Must run before constructing the Daemon: _socket_server unlinks the socket
+    # before binding, so a second instance would otherwise steal it from the
+    # live one and leave two watchers tailing the same logs.
+    if _daemon_is_live():
+        print(f"claude-speak daemon already running (socket: {SOCKET_PATH})",
+              file=sys.stderr)
+        sys.exit(1)
 
     daemon = Daemon(voice=args.voice, rate=args.rate, debounce_ms=args.debounce)
 
