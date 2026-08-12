@@ -4,3 +4,4 @@
 - allow to shrink the UI all the way so that only 'control buttons' are visible without the text box - now it is not possible
 - when I open the UI mid-speaking I need to wait for some time with the 'waiting for output', why? - to discuss
 - I think I might prefer to see the text in the UI as it was originally before formatting (removing the un-speakable values etc) but idk if it will not look more confusing and if it won't break world highting - to discuss
+- allow to pause the session that is currently not speaking so that the next message won't be spoken but paused

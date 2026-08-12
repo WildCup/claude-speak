@@ -53,6 +53,14 @@ import edge_tts  # noqa: E402  (used directly for WordBoundary timings)
 
 CLAUDE_PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.json")
+LEGACY_VOICE_PATH = os.path.join(os.path.expanduser("~"), ".claude", "speech-voice")
+
+DEFAULT_CONFIG = {
+    "voice": "en-US-AndrewMultilingualNeural",
+    "rate": "+10%",
+    "volume": 100,
+}
 
 # Only actively tail files touched within this window (keeps stat load bounded).
 ACTIVE_WINDOW_SEC = 2 * 60 * 60
@@ -69,6 +77,62 @@ SYNTH_RETRY_SEC = 0.6
 
 def now_ms():
     return time.monotonic() * 1000.0
+
+
+def clamp_volume(v):
+    try:
+        return max(0, min(100, int(v)))
+    except (TypeError, ValueError):
+        return DEFAULT_CONFIG["volume"]
+
+
+def normalize_rate(r):
+    """Coerce a rate to the '+N%' / '-N%' form edge-tts expects."""
+    if isinstance(r, (int, float)):
+        return f"{int(r):+d}%"
+    if isinstance(r, str):
+        s = r.strip().rstrip("%").strip()
+        try:
+            return f"{int(float(s)):+d}%"
+        except ValueError:
+            pass
+    return DEFAULT_CONFIG["rate"]
+
+
+def load_config():
+    """Read the saved config, seeding it from the legacy speech-voice file once."""
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH) as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            cfg.update({k: saved[k] for k in DEFAULT_CONFIG if k in saved})
+    except (OSError, ValueError):
+        # no config yet: carry over the voice the old plain-text file selected
+        try:
+            with open(LEGACY_VOICE_PATH) as f:
+                v = f.read().strip()
+            if v:
+                cfg["voice"] = v
+        except OSError:
+            pass
+    cfg["rate"] = normalize_rate(cfg.get("rate"))
+    cfg["volume"] = clamp_volume(cfg.get("volume"))
+    if not isinstance(cfg.get("voice"), str) or not cfg["voice"].strip():
+        cfg["voice"] = DEFAULT_CONFIG["voice"]
+    return cfg
+
+
+def save_config(cfg):
+    """Persist config atomically so a crash mid-write can't truncate it."""
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({k: cfg[k] for k in DEFAULT_CONFIG}, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as e:
+        print(f"could not save config: {e}", file=sys.stderr)
 
 
 def _hard_split(text, limit):
@@ -242,12 +306,21 @@ class Session:
 
 
 class Daemon:
-    def __init__(self, voice="en-US-GuyNeural", rate="+10%", debounce_ms=1500):
-        self.voice = voice
-        self.rate = rate
+    def __init__(self, voice=None, rate=None, debounce_ms=1500):
+        cfg = load_config()
+        # CLI flags win for this run only; they are never written back to disk.
+        self.voice = voice or cfg["voice"]
+        self.rate = normalize_rate(rate) if rate else cfg["rate"]
+        self.volume = cfg["volume"]
         self.debounce_ms = debounce_ms
         self.running = True
         self.start_epoch = time.time()
+
+        self._voices_cache = None       # edge-tts catalogue, fetched on first request
+        self._voices_lock = threading.Lock()
+        self._preview_proc = None
+        self._preview_gen = 0           # newest preview wins; older ones drop their audio
+        self._preview_lock = threading.Lock()
 
         self.synth_chan = Channel()
         self.temp_dir = tempfile.mkdtemp(prefix="claude_speak_")
@@ -372,6 +445,127 @@ class Daemon:
         if sess.state != state:
             sess.state = state
             self.emit_sessions()
+
+    # ─── config ─────────────────────────────────────────────────────────────────
+
+    def current_config(self):
+        return {"voice": self.voice, "rate": self.rate, "volume": self.volume}
+
+    def emit_config(self):
+        self.broadcast({"ev": "config", "config": self.current_config()})
+
+    def cmd_set_config(self, msg):
+        """Apply voice/rate/volume from the UI, persist, and confirm to clients.
+
+        Voice and rate are read per-utterance at synth time, so they take effect
+        on the next chunk. Volume is pushed to the playing process too, so the
+        slider is audible while you drag it.
+        """
+        if "voice" in msg and isinstance(msg["voice"], str) and msg["voice"].strip():
+            self.voice = msg["voice"].strip()
+        if "rate" in msg:
+            self.rate = normalize_rate(msg["rate"])
+        if "volume" in msg:
+            self.volume = clamp_volume(msg["volume"])
+            with self.play_lock:
+                for s in list(self.sessions.values()):
+                    if s.proc is not None:
+                        s.proc.set_volume(self.volume)
+        save_config(self.current_config())
+        self.emit_config()
+
+    def cmd_set_session_voice(self, sid, voice):
+        """Override the voice for one tab; empty/None reverts it to the global."""
+        sess = self._session_by_sid(sid)
+        if sess is None:
+            return
+        with self.play_lock:
+            sess.voice = voice.strip() if isinstance(voice, str) and voice.strip() else None
+        self.broadcast({"ev": "session_voice", "sid": sid, "voice": sess.voice})
+
+    def cmd_voices(self):
+        """Send the edge-tts catalogue (fetched once, then cached)."""
+        def work():
+            with self._voices_lock:
+                if self._voices_cache is None:
+                    try:
+                        loop = asyncio.new_event_loop()
+                        try:
+                            raw = loop.run_until_complete(edge_tts.list_voices())
+                        finally:
+                            loop.close()
+                        self._voices_cache = sorted(
+                            ({"name": v.get("ShortName", ""),
+                              "gender": v.get("Gender", ""),
+                              "locale": v.get("Locale", "")}
+                             for v in raw if v.get("ShortName")),
+                            key=lambda v: v["name"])
+                    except Exception as e:
+                        print(f"voice list failed: {e}", file=sys.stderr)
+                        self.broadcast({"ev": "voices", "voices": [], "error": str(e)})
+                        return
+                voices = self._voices_cache
+            self.broadcast({"ev": "voices", "voices": voices})
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def cmd_preview(self, msg):
+        """Speak a sample line with the given settings, outside the session queues.
+
+        Repeated clicks restart the preview rather than stacking: each request
+        takes a generation number, silences whatever is playing straight away,
+        and any older request still mid-synthesis discards its result.
+        """
+        text = (msg.get("text") or
+                "This is how Claude will sound with the selected voice.")
+        voice = msg.get("voice") or self.voice
+        rate = normalize_rate(msg["rate"]) if "rate" in msg else self.rate
+        volume = clamp_volume(msg["volume"]) if "volume" in msg else self.volume
+
+        with self._preview_lock:
+            self._preview_gen += 1
+            gen = self._preview_gen
+        self._kill_preview()            # cut the current one now, not when synth lands
+
+        def work():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            path = None
+            try:
+                with self.play_lock:
+                    self.file_counter += 1
+                    out = os.path.join(self.temp_dir, f"prev{self.file_counter}.mp3")
+                path, _ = self._render(loop, text, voice, out, rate=rate)
+                if not path:
+                    self.broadcast({"ev": "preview", "ok": False})
+                    return
+                with self._preview_lock:
+                    if gen != self._preview_gen:    # superseded while synthesizing
+                        return
+                self._kill_preview()
+                proc = self._spawn_player(path, volume=volume)
+                with self._preview_lock:
+                    if gen != self._preview_gen:
+                        proc.kill()
+                        return
+                    self._preview_proc = proc
+                self.broadcast({"ev": "preview", "ok": True})
+                while proc.poll() is None and self.running:
+                    time.sleep(0.05)
+            except Exception as e:
+                print(f"preview error: {e}", file=sys.stderr)
+                self.broadcast({"ev": "preview", "ok": False})
+            finally:
+                self._safe_remove(path)
+                loop.close()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _kill_preview(self):
+        with self._preview_lock:
+            proc, self._preview_proc = self._preview_proc, None
+        if proc is not None and proc.poll() is None:
+            proc.kill()
 
     # ─── watcher ────────────────────────────────────────────────────────────────
 
@@ -650,19 +844,20 @@ class Daemon:
                     with self.play_lock:
                         sess.inflight = max(0, sess.inflight - 1)
 
-    def _render(self, loop, text, voice, out_path):
+    def _render(self, loop, text, voice, out_path, rate=None):
         """Synthesize `text` to an audio file, returning (path, word_timings).
 
         edge-tts is a network call, so transient failures are retried before
         falling back to a local voice — otherwise a dropped request means the
         message is silently never spoken. Returns (None, []) if nothing rendered.
         """
+        rate = self.rate if rate is None else rate
         for attempt in range(SYNTH_ATTEMPTS):
             if not self.running:
                 return None, []
             try:
                 words = loop.run_until_complete(
-                    self._synth(text, voice, self.rate, out_path))
+                    self._synth(text, voice, rate, out_path))
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     return out_path, words
                 raise RuntimeError("edge-tts returned no audio")
@@ -727,16 +922,7 @@ class Daemon:
                             return v
                 except OSError:
                     pass
-        gv = os.path.join(os.path.expanduser("~"), ".claude", "speech-voice")
-        if os.path.exists(gv):
-            try:
-                with open(gv) as f:
-                    v = f.read().strip()
-                    if v:
-                        return v
-            except OSError:
-                pass
-        return self.voice
+        return self.voice       # global default, from the saved config
 
     # ─── scheduler: plays one session (the active one) at a time ────────────────
 
@@ -848,14 +1034,15 @@ class Daemon:
             "epoch_ms": now_ms(),
         })
 
-    def _spawn_player(self, path):
+    def _spawn_player(self, path, volume=None):
+        vol = self.volume if volume is None else clamp_volume(volume)
         mpv = shutil.which("mpv")
         if mpv:
             sock = _ipc_socket_path()
             try:
                 proc = subprocess.Popen(
                     [mpv, "--no-video", "--no-terminal", "--really-quiet",
-                     f"--input-ipc-server={sock}", path],
+                     f"--volume={vol}", f"--input-ipc-server={sock}", path],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return _MpvProc(proc, sock)
             except OSError:
@@ -865,14 +1052,15 @@ class Daemon:
         if ffplay:
             try:
                 return _SignalProc(subprocess.Popen(
-                    [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                    [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
+                     "-volume", str(vol), path],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
             except OSError:
                 pass
 
         # no controllable player: fall back to a blocking play (rare)
         threading.Thread(target=cc_speak.play_audio, args=(path,),
-                         daemon=True).start()
+                         kwargs={"volume": vol}, daemon=True).start()
         return _DummyProc()
 
     def _kill(self, proc):
@@ -1155,6 +1343,7 @@ class Daemon:
             threading.Thread(target=self._client_loop, args=(conn,),
                              daemon=True).start()
             self.emit_sessions()    # send fresh state to the new client
+            self.emit_config()
         srv.close()
 
     def _client_loop(self, conn):
@@ -1219,6 +1408,18 @@ class Daemon:
             self.cmd_close(sid)
         elif cmd == "ping":
             self.emit_sessions()
+        elif cmd == "get_config":
+            self.emit_config()
+        elif cmd == "set_config":
+            self.cmd_set_config(msg)
+        elif cmd == "set_session_voice":
+            self.cmd_set_session_voice(sid, msg.get("voice"))
+        elif cmd == "voices":
+            self.cmd_voices()
+        elif cmd == "preview":
+            self.cmd_preview(msg)
+        elif cmd == "stop_preview":
+            self._kill_preview()
 
     def stop(self):
         self.running = False
@@ -1273,6 +1474,9 @@ class _SignalProc:
         self._signal(signal.SIGCONT)
         self.paused = False
         return True
+
+    def set_volume(self, vol):
+        return False        # ffplay's volume is fixed at spawn
 
     def kill(self):
         if self.paused:
@@ -1332,6 +1536,9 @@ class _MpvProc(_SignalProc):
         self.paused = False
         return True
 
+    def set_volume(self, vol):
+        return self._command("set_property", "volume", clamp_volume(vol))
+
     def kill(self):
         super().kill()
         try:
@@ -1351,6 +1558,9 @@ class _DummyProc:
 
     def resume(self):
         return True
+
+    def set_volume(self, vol):
+        return False
 
     def kill(self):
         pass
@@ -1376,8 +1586,9 @@ def _daemon_is_live():
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Claude Speak daemon (socket-controlled)")
-    ap.add_argument("--voice", "-v", default="en-US-GuyNeural")
-    ap.add_argument("--rate", "-r", default="+10%")
+    # voice/rate default to the saved config; passing them overrides for this run only
+    ap.add_argument("--voice", "-v", default=None)
+    ap.add_argument("--rate", "-r", default=None)
     ap.add_argument("--debounce", "-d", type=int, default=1500)
     args = ap.parse_args()
 
