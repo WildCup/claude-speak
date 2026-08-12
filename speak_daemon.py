@@ -26,7 +26,6 @@ import sys
 import json
 import glob
 import time
-import queue
 import shutil
 import signal
 import socket
@@ -38,18 +37,11 @@ import itertools
 import threading
 import subprocess
 import collections
-from datetime import datetime, timezone
+from datetime import datetime
 
-# ─── Engine import (cc-speak.py has a hyphen, can't be imported normally) ──────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from importlib.util import spec_from_file_location, module_from_spec
-
-_cc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cc-speak.py")
-_spec = spec_from_file_location("cc_speak", _cc_path)
-cc_speak = module_from_spec(_spec)
-_spec.loader.exec_module(cc_speak)
-
-import edge_tts  # noqa: E402  (used directly for WordBoundary timings)
+import speak_engine  # noqa: E402  (text cleaning + chunking + fallback playback)
+import edge_tts      # noqa: E402  (used directly for WordBoundary timings)
 
 CLAUDE_PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
@@ -164,7 +156,7 @@ def cap_chunks(chunks):
         if len(c) <= MAX_SYNTH_CHARS:
             out.append(c)
             continue
-        for piece in cc_speak._chunk_text(c, MAX_SYNTH_CHARS):
+        for piece in speak_engine._chunk_text(c, MAX_SYNTH_CHARS):
             if len(piece) <= MAX_SYNTH_CHARS:
                 out.append(piece)
             else:
@@ -781,14 +773,14 @@ class Daemon:
         """Split a full message into chunks and hand them to the synth worker."""
         if sess.disabled:
             return                      # session is muted for all output until enabled
-        chunks = cap_chunks(cc_speak.extract_speakable_chunks(full_text))
+        chunks = cap_chunks(speak_engine.extract_speakable_chunks(full_text))
         if not chunks:
             return
         with self.play_lock:
             sess.msg_chunks = chunks       # remembered for Repeat / Previous / Restart
             # the UI shows these while audio for a seek target is still synthesizing,
             # so they must match what _synth_worker will eventually speak
-            sess.msg_clean = [cc_speak.clean_text(c, skip_code=True, skip_paths=True)
+            sess.msg_clean = [speak_engine.clean_text(c, skip_code=True, skip_paths=True)
                               for c in chunks]
             sess.msg_full = full_text
         self._enqueue_chunks(sess, msg_id, chunks, full_text, 0)
@@ -817,7 +809,7 @@ class Daemon:
             try:
                 if self._is_cancelled(u):
                     continue
-                cleaned = cc_speak.clean_text(u.text, skip_code=True, skip_paths=True)
+                cleaned = speak_engine.clean_text(u.text, skip_code=True, skip_paths=True)
                 if not cleaned.strip() or len(cleaned.split()) < 3:
                     continue
                 self.file_counter += 1
@@ -1059,7 +1051,7 @@ class Daemon:
                 pass
 
         # no controllable player: fall back to a blocking play (rare)
-        threading.Thread(target=cc_speak.play_audio, args=(path,),
+        threading.Thread(target=speak_engine.play_audio, args=(path,),
                          kwargs={"volume": vol}, daemon=True).start()
         return _DummyProc()
 
