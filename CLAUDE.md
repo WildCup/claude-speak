@@ -22,6 +22,7 @@ The voice in `claude-speak.json` is used for every session and for the clipboard
 | `speak_engine.py` | Text cleaning, chunking, edge-tts; also the clipboard CLI |
 | `speak_ctl.py` | One-shot socket command, for hotkeys |
 | `setup/` | systemd unit + desktop entry the user copies into place |
+| `claude-speak.svg` | The icon. Source of truth: hand-written rects, no generator script. `claude-speak.png` is a 128px Pillow raster of it (this box has no `rsvg-convert` / `inkscape`), also copied to `~/.local/share/icons/` for the desktop entry |
 
 ## Shape
 

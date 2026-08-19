@@ -25,23 +25,30 @@ from tkinter import ttk, font as tkfont
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
 
 # ─── palette ───────────────────────────────────────────────────────────────────
-BG        = "#f4f4f6"
-CARD      = "#ffffff"
-INK       = "#20222a"
-MUTED     = "#8a8d98"
-ACCENT    = "#4c8bf5"
-ACCENT_HI = "#3b73d6"
-PILL_BG   = "#e6e7ec"
-PILL_HI   = "#d5d7df"
-BTN_BG    = "#eceef2"
-BTN_HI    = "#dfe2e8"
-BORDER    = "#e0e1e6"
-HL_BG     = "#ffe08a"     # word being spoken
-SPOKEN    = "#9a9da8"     # words already spoken
-TRACK     = "#dfe1e8"     # slider groove
-THUMB     = "#c3c6d0"     # scrollbar thumb
-THUMB_HI  = "#a9adba"
-SEL_BG    = "#e8f0fe"     # selected row in the voice list
+BG        = "#16181d"
+CARD      = "#1d2026"
+INK       = "#e4e7ee"
+MUTED     = "#7f848f"
+ACCENT    = "#3fb950"     # selected tab / active session
+ON_ACCENT = "#0c1410"     # text drawn on top of ACCENT
+DISABLED  = "#4b515c"     # label of a button that can't be pressed
+PILL_BG   = "#262a32"
+PILL_HI   = "#323740"
+BTN_BG    = "#22262d"
+BTN_HI    = "#2e333c"
+BORDER    = "#2c313a"
+HL_BG     = "#2f6d3c"     # word being spoken
+SPOKEN    = "#5b606a"     # words already spoken
+TRACK     = "#2c313a"     # slider groove
+THUMB     = "#3a404a"     # scrollbar thumb
+THUMB_HI  = "#4d545f"
+
+
+def dark_menu(parent):
+    """Tk popup menus keep the system (light) look unless every colour is given."""
+    return tk.Menu(parent, tearoff=0, bg=CARD, fg=INK,
+                   activebackground=ACCENT, activeforeground=ON_ACCENT,
+                   bd=0, relief=tk.FLAT, activeborderwidth=0)
 
 LANG_NAMES = {
     "ar": "Arabic", "cs": "Czech", "da": "Danish", "de": "German", "el": "Greek",
@@ -110,7 +117,7 @@ class Slider(tk.Canvas):
         self.create_line(self.R + 1, cy, x, cy,
                          fill=ACCENT, width=4, capstyle=tk.ROUND)
         self.create_oval(x - self.R, cy - self.R, x + self.R, cy + self.R,
-                         fill="#ffffff", outline=ACCENT, width=2)
+                         fill=CARD, outline=ACCENT, width=2)
 
 
 class SlimScroll(tk.Canvas):
@@ -260,7 +267,10 @@ class SpeakUI:
         card.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=2)
         self.text = tk.Text(card, wrap=tk.WORD, font=self.f_read, relief=tk.FLAT,
                             bg=CARD, fg=INK, padx=14, pady=12, state=tk.DISABLED,
-                            cursor="arrow", highlightthickness=0, borderwidth=0)
+                            cursor="arrow", highlightthickness=0, borderwidth=0,
+                            selectbackground=PILL_HI, selectforeground=INK,
+                            inactiveselectbackground=PILL_HI,
+                            insertbackground=INK)
         self.text.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         self.text.tag_configure("hl", background=HL_BG, foreground=INK)
         self.text.tag_configure("spoken", foreground=SPOKEN)
@@ -290,7 +300,7 @@ class SpeakUI:
         if on:
             b.configure(fg=INK, bg=b._base, cursor="hand2")
         else:
-            b.configure(fg="#c2c4cc", bg=BTN_BG, cursor="arrow")
+            b.configure(fg=DISABLED, bg=BTN_BG, cursor="arrow")
 
     # ─── tab strip ──────────────────────────────────────────────────────────────
 
@@ -321,15 +331,17 @@ class SpeakUI:
     def _paint_pills(self):
         for sid, pill in self.pills.items():
             if sid == self.selected:
-                pill.configure(bg=ACCENT, fg="#ffffff")
+                pill.configure(bg=ACCENT, fg=ON_ACCENT)
                 pill._base = ACCENT
                 pill.unbind("<Enter>"); pill.unbind("<Leave>")
             else:
-                pill.configure(bg=PILL_BG, fg=INK)
+                # a background session that is talking keeps the accent, as text
+                talking = self.sessions.get(sid, {}).get("state") == "playing"
+                pill.configure(bg=PILL_BG, fg=ACCENT if talking else INK)
                 self._hover(pill, PILL_BG, PILL_HI)
 
     def _tab_menu(self, event, sid):
-        m = tk.Menu(self.root, tearoff=0)
+        m = dark_menu(self.root)
         m.add_command(label="Close tab", command=lambda: self._close(sid))
         try:
             m.tk_popup(event.x_root, event.y_root)
@@ -480,7 +492,7 @@ class SpeakUI:
     def _paint_gear(self):
         on = self.mode == "settings"
         self.gear.configure(bg=ACCENT if on else PILL_BG,
-                            fg="#ffffff" if on else INK)
+                            fg=ON_ACCENT if on else INK)
         self.gear._base = ACCENT if on else PILL_BG
 
     # ─── event handling (main thread) ──────────────────────────────────────────
@@ -774,7 +786,7 @@ class SettingsPanel(tk.Frame):
         wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.list = tk.Listbox(wrap, font=self.ui.f_btn, relief=tk.FLAT, bd=0,
                                bg=CARD, fg=INK, selectbackground=ACCENT,
-                               selectforeground="#ffffff", highlightthickness=0,
+                               selectforeground=ON_ACCENT, highlightthickness=0,
                                activestyle="none", exportselection=False)
         self.scroll = SlimScroll(wrap, self.list.yview)
         self.list.configure(yscrollcommand=self.scroll.set)
@@ -841,7 +853,7 @@ class SettingsPanel(tk.Frame):
         return "All languages" if not code else LANG_NAMES.get(code, code.upper())
 
     def _lang_menu(self):
-        m = tk.Menu(self, tearoff=0)
+        m = dark_menu(self)
         m.add_command(label="All languages", command=lambda: self._set_lang(""))
         m.add_separator()
         for code in self._langs():
@@ -866,7 +878,7 @@ class SettingsPanel(tk.Frame):
     def _paint_gender(self):
         for key, b in self.gender_btns.items():
             on = key == self.gender
-            b.configure(bg=ACCENT if on else PILL_BG, fg="#ffffff" if on else INK)
+            b.configure(bg=ACCENT if on else PILL_BG, fg=ON_ACCENT if on else INK)
             b._base = ACCENT if on else PILL_BG
 
     # ─── inbound state ──────────────────────────────────────────────────────────
