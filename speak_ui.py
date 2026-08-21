@@ -188,6 +188,7 @@ class SpeakUI:
         self.pills = {}                 # sid -> tk.Label pill widget
         self.selected = None            # selected sid
         self.follow = True              # auto-select the session that starts talking
+        self.muted_all = False          # is "Stop all" latched? (daemon-owned)
 
         # per-session read-along state
         self.view = {}                  # sid -> dict(text,words,spans,chunks,idx,hl,t0,…)
@@ -240,7 +241,7 @@ class SpeakUI:
                                 bg=PILL_BG, fg=INK, padx=12, pady=6, cursor="hand2")
         self.stopall.pack(side=tk.RIGHT, padx=(0, 6))
         self._hover(self.stopall, PILL_BG, PILL_HI)
-        self.stopall.bind("<Button-1>", lambda e: self.send("stop_all"))
+        self.stopall.bind("<Button-1>", lambda e: self._toggle_mute())
 
         self.tabstrip = tk.Frame(top, bg=BG)
         self.tabstrip.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -276,6 +277,7 @@ class SpeakUI:
         self.text.tag_configure("spoken", foreground=SPOKEN)
         self.text.tag_configure("idle", foreground=MUTED)
 
+        self._paint_stopall()
         self._refresh_buttons()
 
     def _tbtn(self, parent, text, cmd):
@@ -414,11 +416,7 @@ class SpeakUI:
                 self.sock = None
 
     def _toggle(self):
-        s = self.sessions.get(self.selected, {})
-        if s.get("state") == "playing":
-            self.send("pause", self.selected)
-        else:
-            self.send("resume", self.selected)
+        self.send(getattr(self.b_play, "_act", "resume"), self.selected)
 
     def _nav(self, cmd):
         """Paragraph navigation. The daemon has to re-synthesize audio (~1s), so we
@@ -438,6 +436,17 @@ class SpeakUI:
         v.update(text=chunks[target], idx=target, words=[],
                  spans=[], t0=None, pause_accum=0.0, pause_started=None, hl=-1)
         self._refresh_text()
+
+    def _toggle_mute(self):
+        self.send("unmute_all" if self.muted_all else "stop_all")
+
+    def _paint_stopall(self):
+        """Accent background = the latch is engaged; the text names what a click does."""
+        on = self.muted_all
+        self.stopall.configure(text="🔊  Unmute all" if on else "⏹  Stop all",
+                               bg=ACCENT if on else PILL_BG,
+                               fg=ON_ACCENT if on else INK)
+        self.stopall._base = ACCENT if on else PILL_BG
 
     def _toggle_disable(self):
         s = self.sessions.get(self.selected, {})
@@ -535,6 +544,8 @@ class SpeakUI:
         sess = ev.get("sessions", [])
         self.sessions = {s["sid"]: s for s in sess}
         self.order = [s["sid"] for s in sess]
+        self.muted_all = bool(ev.get("muted_all"))
+        self._paint_stopall()
         if self.selected not in self.sessions:
             self.selected = self.order[0] if self.order else None
         self._rebuild_tabs()
@@ -593,8 +604,10 @@ class SpeakUI:
             body, tag = v["text"], None
         else:
             s = self.sessions.get(self.selected, {})
+            paused = ("— paused —" if s.get("has_work")
+                      else "— paused. The next message will wait here. —")
             body = {"ended": "— finished. Repeat to hear it again. —",
-                    "paused": "— paused —",
+                    "paused": paused,
                     "disabled": "— disabled. Enable to hear this session again. —"}.get(
                         s.get("state"), "— waiting for output… —")
             tag = "idle"
@@ -620,25 +633,28 @@ class SpeakUI:
         has_work = s.get("has_work", False)
         active = state in ("playing", "paused")
 
-        if disabled:
+        if disabled or not self.selected:
             # a disabled session is fully silenced; only Enable is actionable
             self._set_enabled(self.b_play, False, "▶ Play")
             self._set_enabled(self.b_skip, False, "⏭ Skip")
             self._set_enabled(self.b_prev, False, "⏪ Previous")
             self._set_enabled(self.b_repeat, False, "⏮ Repeat")
             self._set_enabled(self.b_restart, False, "↺ Restart")
-            self._set_enabled(self.b_disable, True, "✓ Enable")
+            self._set_enabled(self.b_disable, bool(self.selected), "✓ Enable" if disabled
+                              else "⊘ Disable")
             return
 
-        # Pause / Resume / Play
-        if state == "playing":
-            self._set_enabled(self.b_play, True, "⏸ Pause")
-        elif state == "paused":
+        # Pause / Resume / Play. A session with nothing to say is still pausable:
+        # that arms it, so its next message waits instead of interrupting.
+        if state == "paused":
             self._set_enabled(self.b_play, True, "▶ Resume")
-        elif has_work:
-            self._set_enabled(self.b_play, True, "▶ Play")
+            self.b_play._act = "resume"
+        elif state == "playing" or not has_work:
+            self._set_enabled(self.b_play, True, "⏸ Pause")
+            self.b_play._act = "pause"
         else:
-            self._set_enabled(self.b_play, False, "▶ Play")
+            self._set_enabled(self.b_play, True, "▶ Play")
+            self.b_play._act = "resume"
 
         self._set_enabled(self.b_skip, active, "⏭ Skip")
         self._set_enabled(self.b_prev, can_replay, "⏪ Previous")

@@ -18,7 +18,8 @@ Playback model (one speaker, many sessions):
     instead of interrupting what you're hearing. When the speaker is free, the
     longest-waiting session auto-plays. Pausing a session holds the speaker for it;
     pressing Play on another tab switches the speaker to that session and pauses the
-    first exactly where it was.
+    first exactly where it was. "Stop all" latches: it disables every session, and
+    every session discovered afterwards, until it is undone.
 """
 
 import os
@@ -325,6 +326,7 @@ class Daemon:
         self.closed_paths = set()   # tabs the user closed; never re-register them
         self.focus_sid = None       # tab the UI currently shows (for repeat default)
         self.active_sid = None      # session that currently owns the speaker
+        self.muted_all = False      # latched "Stop all": new sessions start disabled
 
         # cancellation: a message stopped mid-flight, or a global flush
         self.generation = 0                 # bumped by stop_all
@@ -421,7 +423,7 @@ class Daemon:
                 }
                 for s in sorted(sessions, key=lambda s: s.order_seq)   # stable order
             ]
-        self.broadcast({"ev": "sessions", "sessions": payload})
+        self.broadcast({"ev": "sessions", "sessions": payload, "muted_all": self.muted_all})
 
     def _set_state(self, sess, state):
         if sess.state != state:
@@ -573,6 +575,9 @@ class Daemon:
             sess.identity = os.stat(path).st_ino
         except OSError:
             sess.file_pos = 0
+        if self.muted_all:
+            sess.disabled = True        # a latched Stop all covers later sessions too
+            sess.state = "disabled"
         self.sessions[path] = sess
         return sess
 
@@ -642,8 +647,12 @@ class Daemon:
                     stale = os.path.getmtime(path) < cutoff
                 except OSError:
                     gone = True
+                # being disabled keeps a tab alive only when the user chose that per
+                # session; under a latched Stop all it is merely the default, so those
+                # tabs prune as usual (and come back disabled if the file is still live)
                 busy = (sess.has_work() or sess.state in ("playing", "paused")
-                        or sess.disabled or sess.sid == self.active_sid)
+                        or (sess.disabled and not self.muted_all)
+                        or sess.sid == self.active_sid)
                 # a deleted file is definitely dead — prune even if it's the focus;
                 # a merely-quiet (stale) file stays if the UI is focused on it.
                 if not gone and sess.sid == self.focus_sid:
@@ -1037,6 +1046,8 @@ class Daemon:
     # ─── transport commands (all per-session) ───────────────────────────────────
 
     def cmd_pause(self, sid=None):
+        """Pause a session. Works on one that is not speaking yet, too: it arms the
+        session, so whatever it says next waits in its queue instead of playing."""
         with self.play_lock:
             sess = self._resolve(sid, prefer_active=True)
             if not sess:
@@ -1049,33 +1060,38 @@ class Daemon:
         self.broadcast({"ev": "pause", "sid": sess.sid})
 
     def cmd_resume(self, sid=None):
-        """Resume / play the given session, making it the active speaker."""
+        """Resume / play the given session, making it the active speaker.
+
+        Un-arming a session that has nothing queued only clears its pause: it must
+        not take the speaker away from a session that is talking."""
         with self.play_lock:
             sess = self._resolve(sid, prefer_active=True)
             if not sess:
                 return
-            # switching speaker: pause whoever holds it now
-            if self.active_sid and self.active_sid != sess.sid:
-                other = self._session_by_sid(self.active_sid)
-                if other and other.proc is not None and not other.player_paused:
-                    other.paused = True
-                    other.proc.pause()
-                    other.player_paused = True
-                    self._set_state(other, "paused")
-            self.active_sid = sess.sid
             sess.paused = False
-            if sess.proc is not None and sess.player_paused:
-                sess.proc.resume()
-                sess.player_paused = False
-            if sess.cur is not None or sess.q or sess.inflight > 0:
+            if sess.has_work():
+                # switching speaker: pause whoever holds it now
+                if self.active_sid and self.active_sid != sess.sid:
+                    other = self._session_by_sid(self.active_sid)
+                    if other and other.proc is not None and not other.player_paused:
+                        other.paused = True
+                        other.proc.pause()
+                        other.player_paused = True
+                        self._set_state(other, "paused")
+                self.active_sid = sess.sid
+                if sess.proc is not None and sess.player_paused:
+                    sess.proc.resume()
+                    sess.player_paused = False
                 self._set_state(sess, "playing")
+            else:
+                self._set_state(sess, "ended" if sess.can_replay() else "idle")
         self.broadcast({"ev": "resume", "sid": sess.sid})
 
     def cmd_toggle(self, sid=None):
         sess = self._resolve(sid, prefer_active=True)
         if not sess:
             return
-        if sess.paused or sess.state != "playing":
+        if sess.paused or (sess.state != "playing" and sess.has_work()):
             self.cmd_resume(sess.sid)
         else:
             self.cmd_pause(sess.sid)
@@ -1137,17 +1153,27 @@ class Daemon:
             self._set_state(sess, "disabled")
 
     def cmd_enable(self, sid=None):
-        """Re-enable a disabled session so future messages speak again."""
+        """Re-enable a disabled session so future messages speak again.
+
+        Enabling one session by hand also ends a latched Stop all: the latch exists to
+        hold silence until the user wants to hear something, and this is that moment.
+        Other sessions it silenced stay disabled."""
         with self.play_lock:
             sess = self._resolve(sid, prefer_active=False)
             if not sess:
                 return
+            self.muted_all = False
             sess.disabled = False
-            self._set_state(sess, "ended" if sess.can_replay() else "idle")
+            sess.state = "ended" if sess.can_replay() else "idle"
+        self.emit_sessions()
 
-    def cmd_stop_all(self):
-        """Silence everything queued, across all sessions."""
+    def cmd_stop_all(self, latch=True):
+        """Silence everything queued, across all sessions, and (from the UI button or
+        a hotkey) latch: every session — including ones discovered later — is disabled
+        until it is unmuted or one session is enabled by hand."""
         with self.play_lock:
+            if latch:
+                self.muted_all = True
             self.generation += 1
             self.synth_chan.drop_where(lambda x: True)
             with self.sessions_lock:
@@ -1164,10 +1190,26 @@ class Daemon:
                 sess.paused = False
                 sess.inflight = 0
                 sess.playing_msg_id = None
-                sess.state = "ended" if sess.can_replay() else "idle"
+                if self.muted_all:
+                    sess.disabled = True
+                sess.state = ("disabled" if sess.disabled
+                              else "ended" if sess.can_replay() else "idle")
             self.active_sid = None
         with self.pending_lock:
             self.pending.clear()
+        self.emit_sessions()
+
+    def cmd_unmute_all(self):
+        """Lift a latched Stop all: later sessions speak again, and every session the
+        latch silenced is re-enabled."""
+        with self.play_lock:
+            self.muted_all = False
+            with self.sessions_lock:
+                sessions = list(self.sessions.values())
+            for sess in sessions:
+                if sess.disabled:
+                    sess.disabled = False
+                    sess.state = "ended" if sess.can_replay() else "idle"
         self.emit_sessions()
 
     def cmd_repeat(self, sid=None):
@@ -1231,7 +1273,7 @@ class Daemon:
                 self.order_counter += 1
                 sess.order_seq = self.order_counter
                 self.sessions[key] = sess
-            sess.disabled = False
+            sess.disabled = False       # an explicit hotkey speaks even while muted
             sess.last_active = time.time()
             self.seq_counter += 1
             msg_id = "_adhoc_%d" % self.seq_counter
@@ -1345,6 +1387,8 @@ class Daemon:
             self.cmd_stop(sid)
         elif cmd == "stop_all":
             self.cmd_stop_all()
+        elif cmd in ("unmute_all", "enable_all"):
+            self.cmd_unmute_all()
         elif cmd == "disable":
             self.cmd_disable(sid)
         elif cmd == "enable":
@@ -1376,7 +1420,7 @@ class Daemon:
 
     def stop(self):
         self.running = False
-        self.cmd_stop_all()
+        self.cmd_stop_all(latch=False)      # shutting down, not muting
         self.synth_chan.close()
         self._cleanup()
 

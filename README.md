@@ -70,7 +70,7 @@ Each active Claude Code session gets a tab. The transport buttons act on the sel
 | Previous / Repeat | Re-read the previous or current paragraph |
 | Restart | Re-read the message from the top |
 | Disable | Silence this session until you enable it again |
-| Stop all | Silence everything queued, in every session |
+| Stop all | Silence everything until undone |
 
 Pressing Play on a different tab moves the speaker to it and pauses the first one where it stood, so nothing is lost by switching.
 
@@ -87,7 +87,8 @@ Whatever is set here is used for every session.
 .venv/bin/python speak_ctl.py toggle      # pause / resume
 .venv/bin/python speak_ctl.py skip        # next paragraph
 .venv/bin/python speak_ctl.py repeat      # re-read current paragraph
-.venv/bin/python speak_ctl.py stop_all    # silence everything
+.venv/bin/python speak_ctl.py stop_all    # silence everything until undone
+.venv/bin/python speak_ctl.py unmute_all  # undo it
 ```
 
 `speak_engine.py` reads piped text aloud in its own tab, which is handy for reading the clipboard:

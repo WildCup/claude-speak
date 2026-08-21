@@ -7,7 +7,8 @@ Bind to keyboard shortcuts, e.g.:
     .venv/bin/python speak_ctl.py toggle    # pause / resume
     .venv/bin/python speak_ctl.py repeat     # re-read last paragraph
     .venv/bin/python speak_ctl.py skip       # jump to next chunk
-    .venv/bin/python speak_ctl.py stop_all   # silence everything queued
+    .venv/bin/python speak_ctl.py stop_all   # silence everything until undone
+    .venv/bin/python speak_ctl.py unmute_all # undo it
 
 Exits 0 on success, 1 if the daemon isn't running.
 """
@@ -19,7 +20,7 @@ import socket
 
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
 
-VALID = {"pause", "resume", "toggle", "skip", "stop", "stop_all",
+VALID = {"pause", "resume", "toggle", "skip", "stop", "stop_all", "unmute_all",
          "repeat", "back", "mute", "unmute", "focus", "ping"}
 
 
