@@ -1291,6 +1291,10 @@ class Daemon:
         """Re-speak the whole current message from the beginning."""
         self._seek(sid, lambda sess: 0)
 
+    def cmd_seek(self, sid=None, idx=0):
+        """Speak the current message from the chosen paragraph (the UI clicks one)."""
+        self._seek(sid, lambda sess: idx)
+
     def _seek(self, sid, pick_idx):
         """Re-queue a session's current message starting at the chosen paragraph."""
         with self.play_lock:
@@ -1467,6 +1471,11 @@ class Daemon:
             self.cmd_prev(sid)
         elif cmd == "restart":
             self.cmd_restart(sid)
+        elif cmd == "seek":
+            try:
+                self.cmd_seek(sid, int(msg.get("idx", 0)))
+            except (TypeError, ValueError):
+                pass
         elif cmd == "focus":
             self.cmd_focus(sid)
         elif cmd == "speak":

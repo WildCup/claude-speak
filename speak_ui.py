@@ -6,8 +6,10 @@ speak_ui: a tiny transport window for the claude-speak daemon.
   - "Stop all" on the top right
   - transport buttons act on the SELECTED tab's session, and enable / disable /
     morph to match that session's state (Pause<->Resume, Stop<->Restart)
-  - live word highlighting of the current paragraph (edge-tts WordBoundary timing),
-    spoken words dimmed
+  - the whole message on screen; the paragraph being spoken is lit, the rest dimmed,
+    and clicking any of them speaks from there
+  - live word highlighting inside it (edge-tts WordBoundary timing), spoken words
+    dimmed
 
 Run alongside the daemon:
     .venv/bin/python speak_ui.py
@@ -39,6 +41,8 @@ BTN_HI    = "#2e333c"
 BORDER    = "#2c313a"
 HL_BG     = "#2f6d3c"     # word being spoken
 SPOKEN    = "#5b606a"     # words already spoken
+OTHER_P   = "#5b606a"     # paragraphs of the message that are not the current one
+CUR_BG    = "#23272f"     # ground behind the paragraph being spoken
 TRACK     = "#2c313a"     # slider groove
 THUMB     = "#3a404a"     # scrollbar thumb
 THUMB_HI  = "#4d545f"
@@ -273,9 +277,14 @@ class SpeakUI:
                             inactiveselectbackground=PILL_HI,
                             insertbackground=INK)
         self.text.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
-        self.text.tag_configure("hl", background=HL_BG, foreground=INK)
+        self.text.tag_configure("cur", background=CUR_BG)
+        self.text.tag_configure("dim", foreground=OTHER_P)
         self.text.tag_configure("spoken", foreground=SPOKEN)
+        self.text.tag_configure("hl", background=HL_BG, foreground=INK)
         self.text.tag_configure("idle", foreground=MUTED)
+        self.text.tag_raise("hl")            # the spoken word wins over both grounds
+        self.text.bind("<Button-1>", self._on_text_click)
+        self.text.bind("<Motion>", self._on_text_motion)
 
         self._paint_stopall()
         self._refresh_buttons()
@@ -426,15 +435,19 @@ class SpeakUI:
         if not sid:
             return
         self.send(cmd, sid)
+        idx = (self.view.get(sid) or {}).get("idx", 0)
+        self._move_to(sid, {"repeat": idx, "prev": idx - 1, "restart": 0}[cmd])
+
+    def _move_to(self, sid, target):
+        """Move the reading card to a paragraph, with no word spoken there yet."""
         v = self.view.get(sid)
-        chunks = (v or {}).get("chunks")
-        if not chunks:
+        ranges = (v or {}).get("ranges")
+        if not ranges:
             return
-        idx = v.get("idx", 0)
-        target = {"repeat": idx, "prev": idx - 1, "restart": 0}[cmd]
-        target = max(0, min(target, len(chunks) - 1))
-        v.update(text=chunks[target], idx=target, words=[],
-                 spans=[], t0=None, pause_accum=0.0, pause_started=None, hl=-1)
+        target = max(0, min(target, len(ranges) - 1))
+        a, b = ranges[target]
+        v.update(text=v["body"][a:b], idx=target, words=[], spans=[], t0=None,
+                 pause_accum=0.0, pause_started=None, hl=-1)
         self._refresh_text()
 
     def _toggle_mute(self):
@@ -563,11 +576,12 @@ class SpeakUI:
         # elapsed_ms is only set on the catch-up event sent when we connect
         # mid-chunk; backdating t0 by it puts read-along where the audio is.
         now = time.monotonic()
+        body, ranges, idx = self._layout(ev.get("chunks"), ev.get("idx", 0), text)
         self.view[sid] = {
             "text": text, "words": words, "spans": self._map_spans(text, words),
             "t0": now - ev.get("elapsed_ms", 0) / 1000.0,
             "pause_accum": 0.0, "pause_started": now if ev.get("paused") else None,
-            "chunks": ev.get("chunks") or [], "idx": ev.get("idx", 0), "hl": -1,
+            "body": body, "ranges": ranges, "idx": idx, "hl": -1,
         }
         if self.follow or sid == self.selected or self.selected is None:
             self.selected = sid
@@ -583,6 +597,7 @@ class SpeakUI:
         if v:
             v["t0"] = None
             v["hl"] = len(v.get("spans") or [])     # past the last word: all spoken
+            v["pause_started"] = None
         if sid == self.selected and v:
             self._repaint(v)
 
@@ -599,13 +614,33 @@ class SpeakUI:
 
     # ─── reading card ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _layout(chunks, idx, text):
+        """Lay the message's paragraphs out as one body, with each one's char range.
+
+        Falls back to the current paragraph alone if the daemon's chunk list does not
+        line up with what is playing, so the read-along never highlights the wrong
+        paragraph."""
+        chunks = list(chunks or [])
+        if not (0 <= idx < len(chunks)) or chunks[idx] != text:
+            chunks, idx = [text], 0
+        body, ranges, at = "", [], 0
+        for i, c in enumerate(chunks):
+            if i:
+                body += "\n\n"
+                at += 2
+            body += c
+            ranges.append((at, at + len(c)))
+            at += len(c)
+        return body, ranges, idx
+
     def _refresh_text(self):
-        """Render the selected session's paragraph. Re-inserting the text drops every
-        tag with it, so unchanged content is left alone — that is what keeps the
+        """Render the selected session's whole message. Re-inserting the text drops
+        every tag with it, so unchanged content is left alone — that is what keeps the
         highlight and the dimmed already-spoken words on screen while paused."""
         v = self.view.get(self.selected)
-        if v and v.get("text"):
-            body, tag = v["text"], None
+        if v and v.get("body"):
+            body, tag = v["body"], None
         else:
             s = self.sessions.get(self.selected, {})
             paused = ("— paused —" if s.get("has_work")
@@ -618,6 +653,8 @@ class SpeakUI:
 
         key = (self.selected, body, tag)
         if key == self._rendered:
+            if v:
+                self._repaint(v)        # same text, but the paragraph may have moved
             return
         self._rendered = key
 
@@ -690,30 +727,68 @@ class SpeakUI:
         self._repaint(v, scroll=True)
 
     def _repaint(self, v, scroll=False):
-        """Paint spoken/highlight tags for v's remembered word position. Safe to call
+        """Paint the current paragraph and v's remembered word position. Safe to call
         any time — it derives everything from v, so it survives a re-render."""
         w = self.text
-        w.tag_remove("hl", "1.0", tk.END)
-        w.tag_remove("spoken", "1.0", tk.END)
-        i = v.get("hl", -1)
-        spans = v.get("spans") or []
-        if i < 0:
+        for t in ("cur", "dim", "spoken", "hl"):
+            w.tag_remove(t, "1.0", tk.END)
+        ranges = v.get("ranges") or []
+        idx = v.get("idx", 0)
+        if idx >= len(ranges):
             return
-        if i >= len(spans):
-            w.tag_add("spoken", "1.0", tk.END)      # paragraph finished
-            return
-        while i >= 0 and not spans[i]:              # unmapped token: use the last known
-            i -= 1
-        if i < 0:
-            return
-        start, end = f"1.0+{spans[i][0]}c", f"1.0+{spans[i][1]}c"
         try:
-            w.tag_add("spoken", "1.0", start)
+            if len(ranges) > 1:
+                for j, (a, b) in enumerate(ranges):
+                    w.tag_add("cur" if j == idx else "dim", f"1.0+{a}c", f"1.0+{b}c")
+            base, stop = ranges[idx]
+            i = v.get("hl", -1)
+            spans = v.get("spans") or []
+            if i < 0:
+                return
+            if i >= len(spans):
+                w.tag_add("spoken", f"1.0+{base}c", f"1.0+{stop}c")   # paragraph done
+                return
+            while i >= 0 and not spans[i]:          # unmapped token: use the last known
+                i -= 1
+            if i < 0:
+                return
+            start = f"1.0+{base + spans[i][0]}c"
+            end = f"1.0+{base + spans[i][1]}c"
+            w.tag_add("spoken", f"1.0+{base}c", start)
             w.tag_add("hl", start, end)
             if scroll:
                 w.see(start)
         except tk.TclError:
             pass
+
+    # ─── click a paragraph to speak from there ─────────────────────────────────
+
+    def _para_at(self, x, y):
+        """Index of the paragraph under the pointer, or None."""
+        v = self.view.get(self.selected)
+        ranges = v.get("ranges") if v else None
+        if not ranges or len(ranges) < 2:
+            return None
+        try:
+            off = len(self.text.get("1.0", f"@{x},{y}"))
+        except tk.TclError:
+            return None
+        for j, (a, b) in enumerate(ranges):
+            if a <= off <= b:
+                return j
+        return None
+
+    def _on_text_click(self, ev):
+        j = self._para_at(ev.x, ev.y)
+        if j is None or not self.sessions.get(self.selected, {}).get("can_replay"):
+            return
+        self.send("seek", self.selected, idx=j)
+        self._move_to(self.selected, j)
+
+    def _on_text_motion(self, ev):
+        clickable = (self._para_at(ev.x, ev.y) is not None
+                     and self.sessions.get(self.selected, {}).get("can_replay"))
+        self.text.config(cursor="hand2" if clickable else "arrow")
 
     @staticmethod
     def _map_spans(text, words):
