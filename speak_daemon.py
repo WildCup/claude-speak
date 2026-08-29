@@ -605,7 +605,13 @@ class Daemon:
             # A single bad iteration (a file vanishing mid-stat, a transient read
             # error) must never kill discovery permanently: log and keep looping.
             try:
-                now = time.time()
+                # NTP steps the clock backward on its first sync after boot. Pace the
+                # rescan on the monotonic clock, and re-baseline start_epoch, or every
+                # later message looks older than startup and nothing is ever spoken.
+                now = time.monotonic()
+                wall = time.time()
+                if wall < self.start_epoch:
+                    self.start_epoch = wall
                 if now - last_rescan > RESCAN_SEC:
                     last_rescan = now
                     found_new = False
@@ -816,7 +822,7 @@ class Daemon:
                             self._safe_remove(out)
                         else:
                             if not sess.q and sess.cur is None:
-                                sess.pending_since = time.time()
+                                sess.pending_since = time.monotonic()
                             sess.q.append(item)
             except Exception as e:
                 print(f"synth error: {e}", file=sys.stderr)
