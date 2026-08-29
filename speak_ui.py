@@ -560,9 +560,13 @@ class SpeakUI:
         sid = ev.get("sid")
         text = ev.get("text", "")
         words = ev.get("words", [])
+        # elapsed_ms is only set on the catch-up event sent when we connect
+        # mid-chunk; backdating t0 by it puts read-along where the audio is.
+        now = time.monotonic()
         self.view[sid] = {
             "text": text, "words": words, "spans": self._map_spans(text, words),
-            "t0": time.monotonic(), "pause_accum": 0.0, "pause_started": None,
+            "t0": now - ev.get("elapsed_ms", 0) / 1000.0,
+            "pause_accum": 0.0, "pause_started": now if ev.get("paused") else None,
             "chunks": ev.get("chunks") or [], "idx": ev.get("idx", 0), "hl": -1,
         }
         if self.follow or sid == self.selected or self.selected is None:

@@ -259,7 +259,9 @@ class Session:
         self.q = collections.deque()     # PlayItems waiting to play
         self.cur = None                  # PlayItem currently on the speaker
         self.proc = None                 # its player process (_MpvProc / _SignalProc)
-        self.player_paused = False       # is the player itself currently paused?
+        self._player_paused = False      # is the player itself currently paused?
+        self._pause_started = None       # monotonic time the player went quiet
+        self.pause_accum = 0.0           # silent seconds inside the current chunk
         self.paused = False              # user paused this session
         self.inflight = 0                # utterances queued to synth, not yet in q
         self.gen_token = 0               # bumped by this session's stop/replay
@@ -277,6 +279,39 @@ class Session:
         self.msg_full = None             # its full text
         self.cur_idx = 0                 # chunk index currently playing / last played
         self.cur_started = 0.0           # monotonic time the current chunk began
+
+    @property
+    def player_paused(self):
+        return self._player_paused
+
+    @player_paused.setter
+    def player_paused(self, value):
+        """Flipping this keeps pause_accum honest, so elapsed_ms() stays the amount
+        of audio actually heard however the pause was reached."""
+        value = bool(value)
+        if value == self._player_paused:
+            return
+        self._player_paused = value
+        if value:
+            self._pause_started = time.monotonic()
+        elif self._pause_started is not None:
+            self.pause_accum += time.monotonic() - self._pause_started
+            self._pause_started = None
+
+    def start_clock(self):
+        """Begin timing a new chunk: nothing heard, nothing paused, yet."""
+        self.cur_started = time.monotonic()
+        self.pause_accum = 0.0
+        self._pause_started = None
+
+    def elapsed_ms(self):
+        """Milliseconds of the current chunk already heard, pauses excluded."""
+        if not self.cur_started:
+            return 0.0
+        silent = self.pause_accum
+        if self._pause_started is not None:
+            silent += time.monotonic() - self._pause_started
+        return max(0.0, (time.monotonic() - self.cur_started - silent) * 1000.0)
 
     def can_replay(self):
         return self.played and bool(self.msg_chunks)
@@ -405,6 +440,23 @@ class Daemon:
                     dead.append(c)
             for c in dead:
                 self.clients.remove(c)
+
+    def send(self, conn, obj):
+        try:
+            conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+        except OSError:
+            with self.clients_lock:
+                if conn in self.clients:
+                    self.clients.remove(conn)
+
+    def emit_playing(self, conn):
+        """Catch a just-connected client up on what is already on the speaker."""
+        with self.sessions_lock:
+            sessions = list(self.sessions.values())
+        with self.play_lock:
+            events = [self._play_event(s) for s in sessions if s.cur is not None]
+        for ev in events:
+            self.send(conn, ev)
 
     def emit_sessions(self):
         with self.sessions_lock:
@@ -989,13 +1041,20 @@ class Daemon:
         item = sess.cur
         sess.playing_msg_id = item.msg_id
         sess.cur_idx = item.idx                  # where we are in the message
-        sess.cur_started = time.monotonic()
+        sess.start_clock()
         sess.played = True
         proc = self._spawn_player(item.path)
         sess.proc = proc
         sess.player_paused = False
         self._set_state(sess, "playing")
-        self.broadcast({
+        self.broadcast(self._play_event(sess))
+
+    def _play_event(self, sess):
+        """The `play` event for whatever sess has on the speaker. `elapsed_ms` is how
+        far in it already is, so a client connecting mid-chunk starts read-along in
+        the right place instead of at the first word."""
+        item = sess.cur
+        return {
             "ev": "play",
             "sid": sess.sid,
             "msg_id": item.msg_id,
@@ -1005,7 +1064,9 @@ class Daemon:
             "words": item.words,
             "chunks": list(sess.msg_clean),   # lets the UI jump paragraphs instantly
             "epoch_ms": now_ms(),
-        })
+            "elapsed_ms": sess.elapsed_ms(),
+            "paused": sess.player_paused,
+        }
 
     def _spawn_player(self, path, volume=None):
         vol = self.volume if volume is None else clamp_volume(volume)
@@ -1347,6 +1408,7 @@ class Daemon:
                              daemon=True).start()
             self.emit_sessions()    # send fresh state to the new client
             self.emit_config()
+            self.emit_playing(conn)
         srv.close()
 
     def _client_loop(self, conn):
