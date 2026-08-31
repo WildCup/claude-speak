@@ -41,8 +41,7 @@ BTN_HI    = "#2e333c"
 BORDER    = "#2c313a"
 HL_BG     = "#2f6d3c"     # word being spoken
 SPOKEN    = "#5b606a"     # words already spoken
-OTHER_P   = "#5b606a"     # paragraphs of the message that are not the current one
-CUR_BG    = "#23272f"     # ground behind the paragraph being spoken
+UNREAD    = "#454b56"     # paragraphs of the message still to come
 TRACK     = "#2c313a"     # slider groove
 THUMB     = "#3a404a"     # scrollbar thumb
 THUMB_HI  = "#4d545f"
@@ -195,8 +194,9 @@ class SpeakUI:
         self.muted_all = False          # is "Stop all" latched? (daemon-owned)
 
         # per-session read-along state
-        self.view = {}                  # sid -> dict(text,words,spans,chunks,idx,hl,t0,…)
+        self.view = {}                  # sid -> dict(text,words,spans,ranges,idx,hl,t0,…)
         self._rendered = None           # (sid,body,tag) currently in the text widget
+        self.stick = True               # follow the spoken word, until you scroll off it
 
         self._fonts()
         self._set_icon()
@@ -275,16 +275,21 @@ class SpeakUI:
                             cursor="arrow", highlightthickness=0, borderwidth=0,
                             selectbackground=PILL_HI, selectforeground=INK,
                             inactiveselectbackground=PILL_HI,
-                            insertbackground=INK)
+                            insertbackground=INK,
+                            # a drag in here must not become the X PRIMARY selection,
+                            # or it replaces whatever shift+Insert would have pasted
+                            exportselection=False)
         self.text.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
-        self.text.tag_configure("cur", background=CUR_BG)
-        self.text.tag_configure("dim", foreground=OTHER_P)
+        self.text.tag_configure("read", foreground=SPOKEN)
+        self.text.tag_configure("unread", foreground=UNREAD)
         self.text.tag_configure("spoken", foreground=SPOKEN)
         self.text.tag_configure("hl", background=HL_BG, foreground=INK)
         self.text.tag_configure("idle", foreground=MUTED)
-        self.text.tag_raise("hl")            # the spoken word wins over both grounds
+        self.text.tag_raise("hl")            # the spoken word wins over everything
         self.text.bind("<Button-1>", self._on_text_click)
         self.text.bind("<Motion>", self._on_text_motion)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.text.bind(seq, self._on_text_scroll)
 
         self._paint_stopall()
         self._refresh_buttons()
@@ -445,6 +450,7 @@ class SpeakUI:
         if not ranges:
             return
         target = max(0, min(target, len(ranges) - 1))
+        self.stick = True
         a, b = ranges[target]
         v.update(text=v["body"][a:b], idx=target, words=[], spans=[], t0=None,
                  pause_accum=0.0, pause_started=None, hl=-1)
@@ -657,6 +663,7 @@ class SpeakUI:
                 self._repaint(v)        # same text, but the paragraph may have moved
             return
         self._rendered = key
+        self.stick = True               # a new message pulls the view back to it
 
         w = self.text
         w.config(state=tk.NORMAL)
@@ -730,16 +737,19 @@ class SpeakUI:
         """Paint the current paragraph and v's remembered word position. Safe to call
         any time — it derives everything from v, so it survives a re-render."""
         w = self.text
-        for t in ("cur", "dim", "spoken", "hl"):
+        for t in ("read", "unread", "spoken", "hl"):
             w.tag_remove(t, "1.0", tk.END)
         ranges = v.get("ranges") or []
         idx = v.get("idx", 0)
         if idx >= len(ranges):
             return
         try:
-            if len(ranges) > 1:
-                for j, (a, b) in enumerate(ranges):
-                    w.tag_add("cur" if j == idx else "dim", f"1.0+{a}c", f"1.0+{b}c")
+            # the paragraph being spoken is the only one at full strength; what is
+            # still to come is darker than what has already been read
+            for j, (a, b) in enumerate(ranges):
+                if j != idx:
+                    w.tag_add("read" if j < idx else "unread",
+                              f"1.0+{a}c", f"1.0+{b}c")
             base, stop = ranges[idx]
             i = v.get("hl", -1)
             spans = v.get("spans") or []
@@ -756,7 +766,10 @@ class SpeakUI:
             end = f"1.0+{base + spans[i][1]}c"
             w.tag_add("spoken", f"1.0+{base}c", start)
             w.tag_add("hl", start, end)
-            if scroll:
+            # only chase the word when it is actually off screen: a see() that cannot
+            # reach its index scrolls to the end, and re-issuing it loops forever
+            if scroll and self.stick and w.compare(start, "<", "end-1c") \
+                    and not w.bbox(start):
                 w.see(start)
         except tk.TclError:
             pass
@@ -789,6 +802,28 @@ class SpeakUI:
         clickable = (self._para_at(ev.x, ev.y) is not None
                      and self.sessions.get(self.selected, {}).get("can_replay"))
         self.text.config(cursor="hand2" if clickable else "arrow")
+
+    def _on_text_scroll(self, _ev):
+        """Scrolling hands the view to you: auto-scroll stops while the spoken word is
+        off screen, and picks up again once you scroll back onto it."""
+        self.root.after_idle(self._check_stick)
+
+    def _check_stick(self):
+        v = self.view.get(self.selected)
+        ranges = (v or {}).get("ranges")
+        if not ranges:
+            self.stick = True
+            return
+        idx = min(v.get("idx", 0), len(ranges) - 1)
+        spans = v.get("spans") or []
+        i = v.get("hl", -1)
+        off = ranges[idx][0]
+        if 0 <= i < len(spans) and spans[i]:
+            off += spans[i][0]
+        try:
+            self.stick = self.text.bbox(f"1.0+{off}c") is not None
+        except tk.TclError:
+            self.stick = True
 
     @staticmethod
     def _map_spans(text, words):
