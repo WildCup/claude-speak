@@ -170,11 +170,13 @@ class SlimScroll(tk.Canvas):
 
 
 class SpeakUI:
+    TOP_PAD = 16                        # the top row's vertical packing pads
+
     def __init__(self, root):
         self.root = root
         root.title("claude-speak")
         root.geometry("680x360")
-        root.minsize(560, 240)
+        root.minsize(300, 96)          # refined once the strips are measured
         root.configure(bg=BG)
 
         self.events = queue.Queue()
@@ -185,6 +187,10 @@ class SpeakUI:
         self.voices = []                # edge-tts catalogue, filled on first request
         self.setpanel = None            # built lazily the first time ⚙ is opened
         self.mode = "read"              # "read" | "settings" — swapped in-window
+        self.compact = False            # narrow window: buttons drop their labels
+        self._strips = None             # measured heights of top/transport/status
+        self._bar_w = None              # transport width with full captions
+        self._min_w = None              # transport width with glyphs only
 
         self.order = []                 # sids, in display order
         self.sessions = {}              # sid -> dict(label,state,can_replay,has_work,active)
@@ -253,9 +259,12 @@ class SpeakUI:
         # Pack the fixed strips (status, transport) from the bottom FIRST, so the
         # reading card's expand=True only claims the leftover middle — otherwise the
         # card eats everything and the transport bar collapses to zero height.
-        self.status = tk.Label(self.root, text="connecting…", anchor=tk.W,
+        self.statuswrap = tk.Frame(self.root, bg=BG)
+        self.statuswrap.pack(side=tk.BOTTOM, fill=tk.X)
+        self.statuswrap.pack_propagate(False)
+        self.status = tk.Label(self.statuswrap, text="connecting…", anchor=tk.W,
                                font=self.f_status, bg=BG, fg=MUTED, padx=12, pady=3)
-        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status.pack(side=tk.TOP, fill=tk.X)
 
         # transport for the selected session
         bar = self.bar = tk.Frame(self.root, bg=BG)
@@ -270,7 +279,8 @@ class SpeakUI:
         # middle: reading card (fills whatever is left between top and bottom strips)
         card = self.card = tk.Frame(self.root, bg=BORDER)
         card.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=2)
-        self.text = tk.Text(card, wrap=tk.WORD, font=self.f_read, relief=tk.FLAT,
+        self.text = tk.Text(card, wrap=tk.WORD, width=1, height=1,
+                            font=self.f_read, relief=tk.FLAT,
                             bg=CARD, fg=INK, padx=14, pady=12, state=tk.DISABLED,
                             cursor="arrow", highlightthickness=0, borderwidth=0,
                             selectbackground=PILL_HI, selectforeground=INK,
@@ -291,12 +301,84 @@ class SpeakUI:
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.text.bind(seq, self._on_text_scroll)
 
+        self._measure()                 # sizes must be read before propagation is off
+        self.top.pack_propagate(False)
+        self.root.bind("<Configure>", self._on_resize)
         self._paint_stopall()
         self._refresh_buttons()
 
+    # ─── compact mode ───────────────────────────────────────────────────────────
+
+    def _on_resize(self, event):
+        if event.widget is not self.root:
+            return
+        compact = event.width < self._bar_w
+        if compact != self.compact:
+            self.compact = compact
+            self._recaption()
+        self._fit_strips(event.height)
+
+    def _recaption(self):
+        for b in (self.b_prev, self.b_repeat, self.b_play, self.b_skip,
+                  self.b_restart, self.b_disable):
+            b.configure(text=self._label(b._full))
+        self._paint_stopall()
+
+    def _fit_strips(self, height):
+        """Hand out the window's height: transport first, then top row, then status.
+
+        Whatever is left goes to the reading card, so each strip shrinks smoothly
+        into its own space instead of freeing height the card would grab back.
+        """
+        top_full, bar_full, st_full = self._strips
+        rem = max(0, height - bar_full)
+        top_h = min(top_full, rem)
+        rem -= top_h                    # claimed even when only the pads fit, so the
+        st_h = min(st_full, rem)        # status line cannot reappear as the top goes
+
+        self._fit(self.top, top_h - self.TOP_PAD,
+                  dict(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 6),
+                       before=self._body()))
+        self._fit(self.statuswrap, st_h,
+                  dict(side=tk.BOTTOM, fill=tk.X, before=self.bar))
+
+    def _fit(self, w, h, opts):
+        """Give a strip h pixels of height, unpacking it once it reaches zero."""
+        if h <= 0:
+            w.pack_forget()
+            return
+        w.configure(height=h)
+        if not w.winfo_manager():
+            w.pack(**opts)
+
+    def _measure(self):
+        """Record the heights of the fixed rows and the transport's width with full
+        captions and with glyphs only — the width the window may shrink to."""
+        self.root.update_idletasks()    # requested sizes are only real after a pass
+        self._strips = (self.top.winfo_reqheight() + self.TOP_PAD,
+                        self.bar.winfo_reqheight() + 12,
+                        self.status.winfo_reqheight())
+        self._bar_w = self.bar.winfo_reqwidth() + 20
+        self.compact = True             # measure the glyph-only row too, then undo
+        self._recaption()
+        self.root.update_idletasks()
+        self._min_w = self.bar.winfo_reqwidth() + 20
+        self.compact = False
+        self._recaption()
+        self.root.update_idletasks()
+        self.root.minsize(self._min_w, self._strips[1])
+
+    def _body(self):
+        return self.setpanel if self.mode == "settings" else self.card
+
+    def _label(self, text):
+        """The button's caption, trimmed to its leading glyph while compact."""
+        return text.split(" ", 1)[0] if self.compact else text
+
     def _tbtn(self, parent, text, cmd):
-        b = tk.Label(parent, text=text, font=self.f_btn, bg=BTN_BG, fg=INK,
-                     padx=9, pady=7, cursor="hand2")
+        b = tk.Label(parent, text=self._label(text), font=self.f_btn, bg=BTN_BG,
+                     fg=INK, padx=9, pady=7, cursor="hand2")
+        b._full = text
         b.pack(side=tk.LEFT, padx=(0, 5))
         b._cmd = cmd
         b._enabled = True
@@ -312,7 +394,8 @@ class SpeakUI:
     def _set_enabled(self, b, on, text=None):
         b._enabled = on
         if text is not None:
-            b.configure(text=text)
+            b._full = text
+            b.configure(text=self._label(text))
         if on:
             b.configure(fg=INK, bg=b._base, cursor="hand2")
         else:
@@ -462,7 +545,7 @@ class SpeakUI:
     def _paint_stopall(self):
         """Accent background = the latch is engaged; the text names what a click does."""
         on = self.muted_all
-        self.stopall.configure(text="🔊  Unmute all" if on else "⏹  Stop all",
+        self.stopall.configure(text=self._label("🔊  Unmute all" if on else "⏹  Stop all"),
                                bg=ACCENT if on else PILL_BG,
                                fg=ON_ACCENT if on else INK)
         self.stopall._base = ACCENT if on else PILL_BG
