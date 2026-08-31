@@ -43,6 +43,9 @@ HL_BG     = "#2f6d3c"     # word being spoken
 SPOKEN    = "#5b606a"     # words already spoken
 UNREAD    = "#454b56"     # paragraphs of the message still to come
 TRACK     = "#2c313a"     # slider groove
+
+PILL_PADX = 12            # a pill's own left/right padding
+TAB_GAP   = 6             # space after a pill
 THUMB     = "#3a404a"     # scrollbar thumb
 THUMB_HI  = "#4d545f"
 
@@ -275,6 +278,9 @@ class SpeakUI:
         self.b_skip    = self._tbtn(bar, "⏭ Skip", lambda: self.send("skip", self.selected))
         self.b_restart = self._tbtn(bar, "↺ Restart", lambda: self._nav("restart"))
         self.b_disable = self._tbtn(bar, "⊘ Disable", self._toggle_disable)
+        # no trailing gap on the last one: its right edge is the row's, level with
+        # the gear above it, and the window may shrink those pixels further
+        self.b_disable.pack_configure(padx=0)
 
         # middle: reading card (fills whatever is left between top and bottom strips)
         card = self.card = tk.Frame(self.root, bg=BORDER)
@@ -316,6 +322,7 @@ class SpeakUI:
         if compact != self.compact:
             self.compact = compact
             self._recaption()
+        self._fit_tabs(event.width - 20)        # the top row's horizontal pads
         self._fit_strips(event.height)
 
     def _recaption(self):
@@ -407,7 +414,7 @@ class SpeakUI:
         for w in self.tabstrip.winfo_children():
             w.destroy()
         self.pills = {}
-        # disambiguate sessions that share a label (e.g. two convos in one project)
+        # a project name alone names the tab; only sessions sharing one need more
         counts = {}
         for sid in self.order:
             lbl = self.sessions.get(sid, {}).get("label") or sid[:8]
@@ -416,16 +423,69 @@ class SpeakUI:
             s = self.sessions.get(sid, {})
             label = s.get("label") or sid[:8]
             if counts.get(label, 0) > 1:
-                label = f"{label}·{sid[:4]}"
+                label = f"{label}: {s.get('title') or sid[:4]}"
             dot = {"playing": "● ", "paused": "❚❚ ", "disabled": "⊘ ",
                    "ended": "", "idle": ""}.get(s.get("state"), "")
             pill = tk.Label(self.tabstrip, text=dot + label, font=self.f_pill,
-                            padx=12, pady=6, cursor="hand2")
-            pill.pack(side=tk.LEFT, padx=(0, 6))
+                            padx=PILL_PADX, pady=6, cursor="hand2")
+            pill._dot = dot
+            pill._full = label
+            pill.pack(side=tk.LEFT, padx=(0, TAB_GAP))
             pill.bind("<Button-1>", lambda e, x=sid: self._select(x, user=True))
             pill.bind("<Button-3>", lambda e, x=sid: self._tab_menu(e, x))
             self.pills[sid] = pill
         self._paint_pills()
+        self._fit_tabs()
+
+    def _fit_tabs(self, top_w=None):
+        """Share the top row's free width between the tabs, so every tab stays on
+        screen. A caption that already fits keeps its width and the rest split what
+        is left; too little for that and each is simply cut where it runs out."""
+        if not self.pills:
+            return
+        if top_w is None:
+            top_w = self.top.winfo_width()
+        if top_w <= 1:
+            return                      # not laid out yet; the first resize fits them
+        room = top_w - self.gear.winfo_reqwidth() - TAB_GAP
+        if self.stopall.winfo_manager():
+            room -= self.stopall.winfo_reqwidth() + TAB_GAP
+        pills = [self.pills[sid] for sid in self.order if sid in self.pills]
+        room -= sum(2 * PILL_PADX + TAB_GAP + self.f_pill.measure(p._dot)
+                    for p in pills)
+        want = [self.f_pill.measure(p._full) for p in pills]
+        for pill, px in zip(pills, self._share(want, room)):
+            pill.configure(text=pill._dot + self._cut(pill._full, px))
+
+    @staticmethod
+    def _share(want, total):
+        """Hand out `total` pixels: whoever fits in an even split takes only what
+        they want, and their change goes back into the split for the others."""
+        caps = list(want)
+        free = set(range(len(want)))
+        while free:
+            even = max(0, total) // len(free)
+            fits = {i for i in free if want[i] <= even}
+            if not fits:
+                for i in free:
+                    caps[i] = even
+                break
+            total -= sum(want[i] for i in fits)
+            free -= fits
+        return caps
+
+    def _cut(self, text, px):
+        """The longest head of `text` that draws within `px` pixels."""
+        if self.f_pill.measure(text) <= px:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.f_pill.measure(text[:mid]) <= px:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo].rstrip()
 
     def _paint_pills(self):
         for sid, pill in self.pills.items():
@@ -549,6 +609,7 @@ class SpeakUI:
                                bg=ACCENT if on else PILL_BG,
                                fg=ON_ACCENT if on else INK)
         self.stopall._base = ACCENT if on else PILL_BG
+        self._fit_tabs()            # its two captions are different widths
 
     def _toggle_disable(self):
         s = self.sessions.get(self.selected, {})
@@ -596,6 +657,7 @@ class SpeakUI:
         self.bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(6, 6))
         self.card.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=2)
         self.mode = "read"
+        self._fit_tabs()
         self._paint_gear()
         self._rendered = None           # force a repaint of the reading card
         self._refresh_text()

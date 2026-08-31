@@ -60,6 +60,12 @@ POLL_SEC = 1.0
 RESCAN_SEC = 3.0
 TICK_SEC = 0.04
 
+# A session's title record is rewritten every few turns, so the newest one sits
+# near the end of the file — but a file-history snapshot line can be megabytes.
+TITLE_TAIL_BYTES = 1 << 20
+# The opening records (mode, permissions, snapshots) carry no cwd.
+LABEL_HEAD_LINES = 40
+
 # edge-tts is a network call and rejects very long inputs. Retry transient
 # failures, then fall back to a local voice so a message is never silently lost.
 MAX_SYNTH_CHARS = 3000
@@ -250,6 +256,7 @@ class Session:
     def __init__(self, sid, label, path):
         self.sid = sid              # stable id (sessionId or file stem)
         self.label = label          # human label (basename of cwd)
+        self.title = ""             # Claude Code's own title for the conversation
         self.path = path            # jsonl path
         self.file_pos = 0
         self.identity = None        # inode, to detect file replacement
@@ -466,6 +473,7 @@ class Daemon:
                 {
                     "sid": s.sid,
                     "label": s.label,
+                    "title": s.title,
                     "state": s.state,
                     "disabled": s.disabled,
                     "can_replay": s.can_replay(),
@@ -620,6 +628,7 @@ class Daemon:
         sid = os.path.splitext(os.path.basename(path))[0]
         label = self._label_for(path)
         sess = Session(sid, label, path)
+        sess.title = self._title_for(path) or ""
         self.order_counter += 1
         sess.order_seq = self.order_counter
         try:
@@ -637,7 +646,7 @@ class Daemon:
         """Best-effort human label: basename of the cwd recorded in the file."""
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
-                for _ in range(5):
+                for _ in range(LABEL_HEAD_LINES):
                     line = f.readline()
                     if not line:
                         break
@@ -650,6 +659,22 @@ class Daemon:
         except OSError:
             pass
         return os.path.basename(os.path.dirname(path))
+
+    def _title_for(self, path):
+        """The title Claude Code gives the conversation — what its terminal tab
+        shows. None until Claude Code has written one."""
+        try:
+            with open(path, "rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                f.seek(max(0, size - TITLE_TAIL_BYTES))
+                data = f.read().decode("utf-8", "replace")
+        except OSError:
+            return None
+        for line in reversed(data.split("\n")):
+            title = self._ai_title(line)
+            if title:
+                return title
+        return None
 
     def _watcher(self):
         last_rescan = 0.0
@@ -724,7 +749,8 @@ class Daemon:
         return removed
 
     def _tail(self, sess):
-        """Read new lines from one session file. Returns True if it became active."""
+        """Read new lines from one session file. Returns True if the UI needs a
+        fresh session list — the session became active, or it was retitled."""
         if sess.adhoc:
             return False            # no file behind it; its text arrives over the socket
         try:
@@ -750,10 +776,15 @@ class Daemon:
             return False
 
         became_active = False
+        retitled = False
         for line in data.split("\n"):
             line = line.strip()
             if not line:
                 continue
+            title = self._ai_title(line)
+            if title and title != sess.title:
+                sess.title = title
+                retitled = True
             text, msg_id, ts = self._extract(line)
             if not text:
                 continue
@@ -772,7 +803,20 @@ class Daemon:
                 p["t"] = now_ms()
         if became_active and self.focus_sid is None:
             self.focus_sid = sess.sid
-        return became_active
+        return became_active or retitled
+
+    @staticmethod
+    def _ai_title(line):
+        """The title this line gives the conversation, or None if it sets none."""
+        if '"ai-title"' not in line:
+            return None                 # cheap reject: most lines are messages
+        try:
+            data = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if data.get("type") != "ai-title":
+            return None
+        return (data.get("aiTitle") or "").strip() or None
 
     @staticmethod
     def _extract(line):
