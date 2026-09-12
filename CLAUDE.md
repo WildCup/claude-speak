@@ -40,7 +40,7 @@ The daemon pushes `sessions` and `config` to every client on connect, and broadc
 
 ## Traps
 
-- **The daemon runs under systemd.** `systemctl --user restart claude-speak` after editing `speak_daemon.py`, or the change isn't live.
+- **The daemon runs under systemd.** `systemctl --user restart claude-speak` after editing `speak_daemon.py` or `speak_engine.py`, or the change isn't live. Restart it as part of making the change, without being asked.
 - **mpv is required for clean pausing.** It's paused over a JSON IPC socket so it corks its audio stream. The `ffplay` path pauses with SIGSTOP, which leaves the sink underrunning and whining, and its volume is fixed at spawn.
 - **Only one daemon may run.** `_daemon_is_live()` probes the socket before startup because `_socket_server` unlinks the socket before binding — a second instance would steal it and leave two watchers on the same logs.
 - **edge-tts is a network call.** `_render` retries, then falls back to local `espeak-ng`; a silently dropped message is the worst failure mode here.

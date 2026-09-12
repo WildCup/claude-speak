@@ -38,6 +38,10 @@ RE_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?\x07|\x1b[()][AB012]|\x1b\
 # Box-drawing and decorative Unicode chars
 RE_BOX = re.compile(r"[─━│┃┌┐└┘├┤┬┴┼╭╮╰╯╔╗╚╝╠╣╦╩╬═║▀▄█▌▐░▒▓●○◆◇■□▪▫★☆✓✗✔✘⎿⎡⎣⎤⎦►▶◀◁▷▸▹◂◃]")
 
+# Emoji and pictographs (✅ ❌ ❓ ⏺ 🔴): the voice would read out their names
+EMOJI_CLASS = r"[⏩-⏺☀-➿⬀-⯿\U0001F000-\U0001FAFF︎️‍⃣]"
+RE_EMOJI = re.compile(EMOJI_CLASS)
+
 # Spinner and progress characters
 RE_SPINNER = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣷⣯⣟⡿⢿⣻⣽⣾✻◐◑◒◓⏳⌛🔄]")
 
@@ -48,7 +52,7 @@ RE_DIFF = re.compile(r"^[+\-]{1,3}(?=\s)", re.MULTILINE)
 RE_DECORATIVE_LINE = re.compile(r"^[\s─━═╌╍┈┉•·…\-_~*#=+|<>\/\\]+$", re.MULTILINE)
 
 # Tool use / XML-like tags from Claude output
-RE_TOOL_TAGS = re.compile(r"</?(?:tool|artifact|function|parameter|result|content|antml)[^>]*>")
+RE_TOOL_TAGS = re.compile(r"</?(?:tool|artifact|function|parameter|result|content|antml)[^<>\n]*>")
 
 # File paths that look like absolute paths (common in Claude Code output)
 RE_FILE_PATH = re.compile(r"(?:^|\s)(?:[A-Za-z]:)?(?:[/\\][\w.\-]+){2,}(?:\:\d+)?", re.MULTILINE)
@@ -79,15 +83,19 @@ RE_COST = re.compile(r"^\s*(?:Cost|Tokens?|Input|Output|Cache)[\s:]+[\d$.,]+.*$"
 # Fenced code blocks (``` ... ```)
 RE_FENCED_CODE = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
 
-# Indented code blocks (4+ spaces, 3+ consecutive lines)
-RE_INDENTED_CODE = re.compile(r"(?:^[ \t]{4,}\S.*\n){3,}", re.MULTILINE)
+# Indented code blocks (4+ spaces, 3+ consecutive lines), but not nested list items
+RE_INDENTED_CODE = re.compile(
+    r"(?:^[ \t]{4,}(?![-*+•]\s|\d+[.)]\s)\S.*\n){3,}", re.MULTILINE)
 
-# JSON blocks (tool call outputs) — objects/arrays spanning multiple lines
-RE_JSON_BLOCK = re.compile(r"^\s*[\[{][\s\S]*?[\]}]\s*$", re.MULTILINE)
+# JSON blocks (tool call outputs): a bare brace on its own line through its match
+RE_JSON_BLOCK = re.compile(
+    r"^[ \t]*[\[{][ \t]*\n[\s\S]*?\n[ \t]*[\]}][,;]?[ \t]*$", re.MULTILINE)
 
 # Tool call output sections (e.g., "Read(...)" followed by indented content)
 RE_TOOL_OUTPUT_SECTION = re.compile(
-    r"^\s*⎿?\s*(?:Read|Write|Edit|Bash|Glob|Grep|Task|TodoWrite|Search)\s*\(.*\).*(?:\n(?:[ \t]+.*|\s*))*",
+    r"^(?P<indent>[ \t]*)⎿?[ \t]*"
+    r"(?:Read|Write|Edit|Bash|Glob|Grep|Task|TodoWrite|Search)\([^\n]*\)[^\n]*"
+    r"(?:\n(?P=indent)[ \t]+\S[^\n]*)*",
     re.MULTILINE,
 )
 
@@ -133,6 +141,46 @@ def filter_non_speech_content(text: str) -> str:
     return text
 
 
+# ─── Hard-wrap Unwrapping ─────────────────────────────────────────────────────
+
+# Lines that begin a block of their own instead of continuing the line above
+RE_BLOCK_START = re.compile(
+    r"(?:[-*+•]\s|\d+[.)]\s|#{1,6}\s|>\s|\||```|[─━│┃┌┐└┘├┤┬┴┼╭╮╰╯►▶]|" + EMOJI_CLASS + ")")
+
+# Lines nothing may be folded into: headers, fence markers, table rows
+RE_NO_FOLD_INTO = re.compile(r"(?:#{1,6}\s|```|\|)")
+
+# End of a sentence or clause — the break after it is a pause worth keeping
+RE_SENTENCE_END = re.compile(r"[.!?:;][\"\')\]]?$")
+
+
+def unwrap_lines(text: str) -> str:
+    """Fold terminal hard-wraps back into whole lines.
+
+    A selection copied out of a terminal breaks at the window width, and the
+    voice reads every one of those newlines as a sentence end. Only mid-sentence
+    breaks are folded: blank lines, list items, headers, tables and fenced code
+    keep their own line.
+    """
+    out = []
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        prev = out[-1].strip() if out else ""
+        if (not in_fence and stripped and prev
+                and not RE_BLOCK_START.match(stripped)
+                and not RE_NO_FOLD_INTO.match(prev)
+                and not RE_SENTENCE_END.search(prev)):
+            out[-1] = out[-1].rstrip() + " " + stripped
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def clean_text(raw: str, skip_code: bool = True, skip_paths: bool = True,
                filter_tool_output: bool = True) -> str:
     """Strip terminal formatting and noise from Claude Code output for natural speech."""
@@ -143,6 +191,9 @@ def clean_text(raw: str, skip_code: bool = True, skip_paths: bool = True,
 
     # Strip spinner/progress chars
     text = RE_SPINNER.sub("", text)
+
+    # Strip emoji
+    text = RE_EMOJI.sub("", text)
 
     # Strip box-drawing chars
     text = RE_BOX.sub(" ", text)
@@ -185,9 +236,9 @@ def clean_text(raw: str, skip_code: bool = True, skip_paths: bool = True,
             text,
             flags=re.DOTALL,
         )
-        # Indented code blocks (4+ spaces, 3+ consecutive lines)
+        # Indented code blocks (4+ spaces, 3+ consecutive lines), but not nested list items
         text = re.sub(
-            r"(?:^[ \t]{4,}\S.*\n){3,}",
+            r"(?:^[ \t]{4,}(?![-*+•]\s|\d+[.)]\s)\S.*\n){3,}",
             "[code block]\n",
             text,
             flags=re.MULTILINE,
@@ -208,19 +259,19 @@ def clean_text(raw: str, skip_code: bool = True, skip_paths: bool = True,
     text = re.sub(r"_{1,3}(\S[^_]*\S)_{1,3}", r"\1", text)
 
     # Markdown headers (# Header) -> just the text
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*#{1,6}\s+", "", text, flags=re.MULTILINE)
 
     # Markdown horizontal rules
-    text = re.sub(r"^[\-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[\-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
 
     # Markdown bullet points: - item, * item -> just the text
     text = re.sub(r"^[\s]*[-*+]\s+", "", text, flags=re.MULTILINE)
 
-    # Numbered lists: 1. item -> just the text
-    text = re.sub(r"^[\s]*\d+[.)]\s+", "", text, flags=re.MULTILINE)
+    # Numbered lists: keep the number, normalized to "1. "
+    text = re.sub(r"^[\s]*(\d+)[.)]\s+", r"\1. ", text, flags=re.MULTILINE)
 
-    # HTML tags that might appear
-    text = re.sub(r"<[^>]+>", "", text)
+    # HTML tags that might appear (a tag name, on one line — "<- foo" is not a tag)
+    text = re.sub(r"</?[A-Za-z][^<>\n]*>", "", text)
 
     # URLs (standalone) -> skip them
     text = re.sub(r"https?://\S+", "", text)
@@ -399,6 +450,25 @@ def play_audio(path: str, blocking: bool = True, volume: int = 100):
 
 
 
+def _paragraph_pieces(para: str):
+    """Yield (piece, starts_line) for a long paragraph: each line whole, or the
+    sentences of a line too long to fit one chunk."""
+    for line in para.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) < 400:
+            yield line, True
+            continue
+        # "25." ends in a period but is no sentence: keep it on its text
+        marker = re.match(r"\d+[.)]\s+", line)
+        head = marker.group() if marker else ""
+        sentences = re.split(r'(?<=[.!?])\s+', line[len(head):])
+        yield head + sentences[0], True
+        for sent in sentences[1:]:
+            yield sent, False
+
+
 def extract_speakable_chunks(text: str) -> list:
     """Extract speakable chunks from text, splitting at natural boundaries."""
     # Split on paragraph boundaries (double newlines) or sentence endings
@@ -416,16 +486,16 @@ def extract_speakable_chunks(text: str) -> list:
         if len(para) < 500:
             chunks.append(para)
         else:
-            # Split long paragraphs into sentences
-            sentences = re.split(r'(?<=[.!?])\s+', para)
+            # Pack whole lines, so list items keep their line start and their pause
             current = ""
-            for sent in sentences:
-                if len(current) + len(sent) < 400:
-                    current = f"{current} {sent}".strip()
+            for piece, starts_line in _paragraph_pieces(para):
+                if not current:
+                    current = piece
+                elif len(current) + len(piece) < 400:
+                    current += ("\n" if starts_line else " ") + piece
                 else:
-                    if current:
-                        chunks.append(current)
-                    current = sent
+                    chunks.append(current)
+                    current = piece
             if current:
                 chunks.append(current)
 
@@ -486,7 +556,8 @@ def main():
     else:
         ap.error("no input: pass text, use --file, or pipe on stdin")
 
-    text = raw if args.raw else clean_text(raw, skip_code=not args.keep_code,
+    text = raw if args.raw else clean_text(unwrap_lines(raw),
+                                           skip_code=not args.keep_code,
                                            skip_paths=not args.keep_paths)
     if not text.strip():
         print("nothing readable after cleaning", file=sys.stderr)
