@@ -304,6 +304,10 @@ class SpeakUI:
         self.text.tag_raise("hl")            # the spoken word wins over everything
         self.text.bind("<Button-1>", self._on_text_click)
         self.text.bind("<Motion>", self._on_text_motion)
+        # click-only: a fast resize can hand this a button drag whose release never arrives,
+        # leaving tk::TextAutoScan scrolling and selecting against the word-follow forever
+        for seq in ("<B1-Motion>", "<B1-Leave>"):
+            self.text.bind(seq, lambda e: "break")
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.text.bind(seq, self._on_text_scroll)
 

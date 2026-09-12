@@ -44,7 +44,7 @@ The daemon pushes `sessions` and `config` to every client on connect, and broadc
 - **mpv is required for clean pausing.** It's paused over a JSON IPC socket so it corks its audio stream. The `ffplay` path pauses with SIGSTOP, which leaves the sink underrunning and whining, and its volume is fixed at spawn.
 - **Only one daemon may run.** `_daemon_is_live()` probes the socket before startup because `_socket_server` unlinks the socket before binding — a second instance would steal it and leave two watchers on the same logs.
 - **edge-tts is a network call.** `_render` retries, then falls back to local `espeak-ng`; a silently dropped message is the worst failure mode here.
-- **Tk's Listbox fights you.** Its class bindings turn a held button into drag-selection plus an auto-scroll loop that only `<ButtonRelease-1>` cancels, and a window resize can strand that loop running forever. The voice list binds `<B1-Motion>` and `<B1-Leave>` to `"break"` to keep it click-only.
+- **Tk's Listbox and Text fight you.** Their class bindings turn a held button into drag-selection plus an auto-scroll loop that only `<ButtonRelease-1>` cancels, and a window resize can strand that loop running forever. The voice list and the reading card bind `<B1-Motion>` and `<B1-Leave>` to `"break"` to keep them click-only.
 - **The daemon echoes a `config` event after every change.** UI code reacting to it must not rebuild or re-scroll the voice list, or the view jumps under the pointer while picking a voice.
 
 ## Platform seams
