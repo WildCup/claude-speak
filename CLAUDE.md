@@ -36,7 +36,7 @@ One speaker, many sessions: only one session is audible at a time, each has its 
 `speak_daemon.py`'s module docstring has the full playback model — read it before touching the scheduler.
 
 Clients talk to `~/.claude/claude-speak.sock`, one JSON object per line.
-The daemon pushes `sessions` and `config` to every client on connect, and broadcasts `play` / `end` / `pause` / `resume` as playback moves.
+The daemon pushes `sessions`, `config` and `tts` to every client on connect, and broadcasts `play` / `end` / `pause` / `resume` as playback moves, and `tts` when edge-tts starts or stops failing.
 
 ## Traps
 

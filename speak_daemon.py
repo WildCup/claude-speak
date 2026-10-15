@@ -346,6 +346,7 @@ class Daemon:
         self._preview_proc = None
         self._preview_gen = 0           # newest preview wins; older ones drop their audio
         self._preview_lock = threading.Lock()
+        self.tts_fallback = False       # is edge-tts failing, so espeak speaks instead?
 
         self.synth_chan = Channel()
         self.temp_dir = tempfile.mkdtemp(prefix="claude_speak_")
@@ -497,6 +498,14 @@ class Daemon:
 
     def emit_config(self):
         self.broadcast({"ev": "config", "config": self.current_config()})
+
+    def emit_tts(self):
+        self.broadcast({"ev": "tts", "fallback": self.tts_fallback})
+
+    def _set_tts_fallback(self, on):
+        if self.tts_fallback != on:
+            self.tts_fallback = on
+            self.emit_tts()
 
     def cmd_set_config(self, msg):
         """Apply voice/rate/volume from the UI, persist, and confirm to clients.
@@ -942,6 +951,7 @@ class Daemon:
                 words = loop.run_until_complete(
                     self._synth(text, voice, rate, out_path))
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    self._set_tts_fallback(False)
                     return out_path, words
                 raise RuntimeError("edge-tts returned no audio")
             except Exception as e:
@@ -952,6 +962,7 @@ class Daemon:
                 else:
                     time.sleep(SYNTH_RETRY_SEC)
 
+        self._set_tts_fallback(True)
         wav = self._synth_local(text, out_path)
         if wav:
             print("edge-tts unavailable; spoke with local fallback voice",
@@ -1456,6 +1467,7 @@ class Daemon:
                              daemon=True).start()
             self.emit_sessions()    # send fresh state to the new client
             self.emit_config()
+            self.emit_tts()
             self.emit_playing(conn)
         srv.close()
 

@@ -11,7 +11,7 @@ Linux only. Forked from [silverdolphin863/claude-speak](https://github.com/silve
 
 ## Install
 
-Requires Python 3.10+, and `mpv` for playback. `espeak-ng` is used automatically if the network is down, and `xsel` is only needed for the read-the-clipboard shortcut below.
+Requires Python 3.10+, and `mpv` for playback. `espeak-ng` is used automatically if edge-tts fails (e.g. you're offline), and `xsel` is only needed for the read-the-clipboard shortcut below.
 
 ```bash
 sudo apt install mpv espeak-ng xsel

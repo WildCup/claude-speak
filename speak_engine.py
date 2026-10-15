@@ -85,7 +85,7 @@ RE_FENCED_CODE = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
 
 # Indented code blocks (4+ spaces, 3+ consecutive lines), but not nested list items
 RE_INDENTED_CODE = re.compile(
-    r"(?:^[ \t]{4,}(?![-*+•]\s|\d+[.)]\s)\S.*\n){3,}", re.MULTILINE)
+    r"(?:^[ \t]{4,}(?![-*+•]\s|(?:\d+|[A-Za-z])[.)]\s)\S.*\n){3,}", re.MULTILINE)
 
 # JSON blocks (tool call outputs): a bare brace on its own line through its match
 RE_JSON_BLOCK = re.compile(
@@ -107,8 +107,8 @@ RE_PATH_LINE = re.compile(
     r"^\s*(?:[A-Za-z]:)?(?:[/\\][\w.\-]+){2,}(?::\d+(?::\d+)?)?\s*$", re.MULTILINE
 )
 
-# Command output patterns ($ command ... or > command ...)
-RE_COMMAND_OUTPUT = re.compile(r"^\s*[$>]\s+\S+.*$", re.MULTILINE)
+# Shell prompt lines ($ command ...)
+RE_COMMAND_OUTPUT = re.compile(r"^\s*\$\s+\S+.*$", re.MULTILINE)
 
 
 def filter_non_speech_content(text: str) -> str:
@@ -143,9 +143,12 @@ def filter_non_speech_content(text: str) -> str:
 
 # ─── Hard-wrap Unwrapping ─────────────────────────────────────────────────────
 
+# Blockquote marker: "> " in markdown, "▎ " in a terminal copy
+RE_QUOTE_MARKER = re.compile(r"^([ \t]*)[>▎][ \t]?", re.MULTILINE)
+
 # Lines that begin a block of their own instead of continuing the line above
 RE_BLOCK_START = re.compile(
-    r"(?:[-*+•]\s|\d+[.)]\s|#{1,6}\s|>\s|\||```|[─━│┃┌┐└┘├┤┬┴┼╭╮╰╯►▶]|" + EMOJI_CLASS + ")")
+    r"(?:[-*+•]\s|(?:\d+|[A-Za-z])[.)]\s|#{1,6}\s|\||```|[─━│┃┌┐└┘├┤┬┴┼╭╮╰╯►▶]|" + EMOJI_CLASS + ")")
 
 # Lines nothing may be folded into: headers, fence markers, table rows
 RE_NO_FOLD_INTO = re.compile(r"(?:#{1,6}\s|```|\|)")
@@ -164,20 +167,28 @@ def unwrap_lines(text: str) -> str:
     """
     out = []
     in_fence = False
+    prev_quoted = False
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("```"):
             in_fence = not in_fence
             out.append(line)
             continue
+        quoted = not in_fence and bool(RE_QUOTE_MARKER.match(line))
+        if quoted:
+            line = RE_QUOTE_MARKER.sub(r"\1", line)
+            stripped = line.strip()
         prev = out[-1].strip() if out else ""
         if (not in_fence and stripped and prev
+                and quoted == prev_quoted
                 and not RE_BLOCK_START.match(stripped)
                 and not RE_NO_FOLD_INTO.match(prev)
                 and not RE_SENTENCE_END.search(prev)):
             out[-1] = out[-1].rstrip() + " " + stripped
         else:
             out.append(line)
+        if stripped:
+            prev_quoted = quoted
     return "\n".join(out)
 
 
@@ -238,7 +249,7 @@ def clean_text(raw: str, skip_code: bool = True, skip_paths: bool = True,
         )
         # Indented code blocks (4+ spaces, 3+ consecutive lines), but not nested list items
         text = re.sub(
-            r"(?:^[ \t]{4,}(?![-*+•]\s|\d+[.)]\s)\S.*\n){3,}",
+            r"(?:^[ \t]{4,}(?![-*+•]\s|(?:\d+|[A-Za-z])[.)]\s)\S.*\n){3,}",
             "[code block]\n",
             text,
             flags=re.MULTILINE,
@@ -258,6 +269,9 @@ def clean_text(raw: str, skip_code: bool = True, skip_paths: bool = True,
     text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
     text = re.sub(r"_{1,3}(\S[^_]*\S)_{1,3}", r"\1", text)
 
+    # Blockquotes -> just the text
+    text = RE_QUOTE_MARKER.sub(r"\1", text)
+
     # Markdown headers (# Header) -> just the text
     text = re.sub(r"^\s*#{1,6}\s+", "", text, flags=re.MULTILINE)
 
@@ -265,10 +279,10 @@ def clean_text(raw: str, skip_code: bool = True, skip_paths: bool = True,
     text = re.sub(r"^\s*[\-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
 
     # Markdown bullet points: - item, * item -> just the text
-    text = re.sub(r"^[\s]*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^[ \t]*[-*+][ \t]+", "", text, flags=re.MULTILINE)
 
     # Numbered lists: keep the number, normalized to "1. "
-    text = re.sub(r"^[\s]*(\d+)[.)]\s+", r"\1. ", text, flags=re.MULTILINE)
+    text = re.sub(r"^[ \t]*(\d+)[.)][ \t]+", r"\1. ", text, flags=re.MULTILINE)
 
     # HTML tags that might appear (a tag name, on one line — "<- foo" is not a tag)
     text = re.sub(r"</?[A-Za-z][^<>\n]*>", "", text)
@@ -461,7 +475,7 @@ def _paragraph_pieces(para: str):
             yield line, True
             continue
         # "25." ends in a period but is no sentence: keep it on its text
-        marker = re.match(r"\d+[.)]\s+", line)
+        marker = re.match(r"(?:\d+|[A-Za-z])[.)]\s+", line)
         head = marker.group() if marker else ""
         sentences = re.split(r'(?<=[.!?])\s+', line[len(head):])
         yield head + sentences[0], True

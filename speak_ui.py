@@ -43,6 +43,7 @@ HL_BG     = "#2f6d3c"     # word being spoken
 SPOKEN    = "#5b606a"     # words already spoken
 UNREAD    = "#454b56"     # paragraphs of the message still to come
 TRACK     = "#2c313a"     # slider groove
+WARN      = "#e3a33b"     # edge-tts is down, the local voice speaks instead
 
 PILL_PADX = 12            # a pill's own left/right padding
 TAB_GAP   = 6             # space after a pill
@@ -267,7 +268,11 @@ class SpeakUI:
         self.statuswrap.pack_propagate(False)
         self.status = tk.Label(self.statuswrap, text="connecting…", anchor=tk.W,
                                font=self.f_status, bg=BG, fg=MUTED, padx=12, pady=3)
-        self.status.pack(side=tk.TOP, fill=tk.X)
+        self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.tts_warn = tk.Label(self.statuswrap, font=self.f_status, bg=BG, fg=WARN,
+                                 padx=12, pady=3,
+                                 text="⚠ edge-tts failing, speaking with espeak · "
+                                      "journalctl --user -u claude-speak")
 
         # transport for the selected session
         bar = self.bar = tk.Frame(self.root, bg=BG)
@@ -703,6 +708,11 @@ class SpeakUI:
             self.config = ev.get("config") or self.config
             if self.setpanel is not None:
                 self.setpanel.set_config(self.config)
+        elif kind == "tts":
+            if ev.get("fallback"):
+                self.tts_warn.pack(side=tk.RIGHT, before=self.status)
+            else:
+                self.tts_warn.pack_forget()
         elif kind == "voices":
             self.voices = ev.get("voices") or []
             if self.setpanel is not None:
