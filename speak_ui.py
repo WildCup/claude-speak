@@ -270,9 +270,7 @@ class SpeakUI:
                                font=self.f_status, bg=BG, fg=MUTED, padx=12, pady=3)
         self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.tts_warn = tk.Label(self.statuswrap, font=self.f_status, bg=BG, fg=WARN,
-                                 padx=12, pady=3,
-                                 text="⚠ edge-tts failing, speaking with espeak · "
-                                      "journalctl --user -u claude-speak")
+                                 padx=12, pady=3)
 
         # transport for the selected session
         bar = self.bar = tk.Frame(self.root, bg=BG)
@@ -709,7 +707,15 @@ class SpeakUI:
             if self.setpanel is not None:
                 self.setpanel.set_config(self.config)
         elif kind == "tts":
-            if ev.get("fallback"):
+            if ev.get("wait"):
+                text = f"◷ edge-tts · {ev['wait']} s"
+                if ev.get("retry"):
+                    text += f" · retry {ev['retry']}/{ev['attempts']}"
+                self.tts_warn.config(text=text)
+                self.tts_warn.pack(side=tk.RIGHT, before=self.status)
+            elif ev.get("fallback"):
+                self.tts_warn.config(text="⚠ edge-tts failing, speaking with espeak · "
+                                          "journalctl --user -u claude-speak")
                 self.tts_warn.pack(side=tk.RIGHT, before=self.status)
             else:
                 self.tts_warn.pack_forget()

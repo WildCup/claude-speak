@@ -70,7 +70,8 @@ LABEL_HEAD_LINES = 40
 # failures, then fall back to a local voice so a message is never silently lost.
 MAX_SYNTH_CHARS = 3000
 SYNTH_ATTEMPTS = 3
-SYNTH_RETRY_SEC = 0.6
+SYNTH_RETRY_SEC = 1.0       #first gap; doubles each retry, since edge-tts fails in bursts
+SLOW_SYNTH_SEC = 2.0        #a wait or attempt this long shows in the UI and the journal
 
 
 def now_ms():
@@ -347,6 +348,10 @@ class Daemon:
         self._preview_gen = 0           # newest preview wins; older ones drop their audio
         self._preview_lock = threading.Lock()
         self.tts_fallback = False       # is edge-tts failing, so espeak speaks instead?
+        self.tts_retry = 0              #edge-tts attempt being waited for, 0 when not retrying
+        self.tts_wait = 0               #whole seconds the speaker has been silent on a slow render
+        self.synth_wait = None          #(session, start) of the chunk the synth worker renders
+        self.silent_since = None        #when the speaker last went quiet
 
         self.synth_chan = Channel()
         self.temp_dir = tempfile.mkdtemp(prefix="claude_speak_")
@@ -500,11 +505,12 @@ class Daemon:
         self.broadcast({"ev": "config", "config": self.current_config()})
 
     def emit_tts(self):
-        self.broadcast({"ev": "tts", "fallback": self.tts_fallback})
+        self.broadcast({"ev": "tts", "fallback": self.tts_fallback, "wait": self.tts_wait,
+                        "retry": self.tts_retry, "attempts": SYNTH_ATTEMPTS})
 
-    def _set_tts_fallback(self, on):
-        if self.tts_fallback != on:
-            self.tts_fallback = on
+    def _set_tts_state(self, fallback, retry):
+        if (self.tts_fallback, self.tts_retry) != (fallback, retry):
+            self.tts_fallback, self.tts_retry = fallback, retry
             self.emit_tts()
 
     def cmd_set_config(self, msg):
@@ -579,9 +585,11 @@ class Daemon:
                 with self.play_lock:
                     self.file_counter += 1
                     out = os.path.join(self.temp_dir, f"prev{self.file_counter}.mp3")
-                path, _ = self._render(loop, text, voice, out, rate=rate)
+                path, _ = self._render(loop, text, voice, out, rate=rate,
+                                       stale=lambda: gen != self._preview_gen)
                 if not path:
-                    self.broadcast({"ev": "preview", "ok": False})
+                    if gen == self._preview_gen:    #a superseded preview isn't a failure
+                        self.broadcast({"ev": "preview", "ok": False})
                     return
                 with self._preview_lock:
                     if gen != self._preview_gen:    # superseded while synthesizing
@@ -915,7 +923,11 @@ class Daemon:
                     continue
                 self.file_counter += 1
                 out = os.path.join(self.temp_dir, f"s{self.file_counter}.mp3")
-                out, words = self._render(loop, cleaned, self.voice, out)
+                self.synth_wait = (sess, time.monotonic())
+                out, words = self._render(
+                    loop, cleaned, self.voice, out,
+                    stale=lambda: self._is_cancelled(u) or (
+                        sess is not None and u.tok != sess.gen_token))
                 if self._is_cancelled(u):       # stopped while we were synthesizing
                     self._safe_remove(out)
                     continue
@@ -932,43 +944,59 @@ class Daemon:
             except Exception as e:
                 print(f"synth error: {e}", file=sys.stderr)
             finally:
+                self.synth_wait = None
                 if sess is not None:
                     with self.play_lock:
                         sess.inflight = max(0, sess.inflight - 1)
 
-    def _render(self, loop, text, voice, out_path, rate=None):
+    def _render(self, loop, text, voice, out_path, rate=None, stale=None):
         """Synthesize `text` to an audio file, returning (path, word_timings).
 
         edge-tts is a network call, so transient failures are retried before
         falling back to a local voice — otherwise a dropped request means the
-        message is silently never spoken. Returns (None, []) if nothing rendered.
+        message is silently never spoken. Returns (None, []) if nothing rendered,
+        or as soon as `stale()` says the result is no longer wanted.
         """
         rate = self.rate if rate is None else rate
         for attempt in range(SYNTH_ATTEMPTS):
-            if not self.running:
+            if not self.running or (stale and stale()):
+                self._set_tts_state(self.tts_fallback, 0)
                 return None, []
+            start = time.monotonic()
             try:
                 words = loop.run_until_complete(
                     self._synth(text, voice, rate, out_path))
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    self._set_tts_fallback(False)
+                    self._log_slow_attempt(attempt, start, len(text), None)
+                    self._set_tts_state(False, 0)
                     return out_path, words
                 raise RuntimeError("edge-tts returned no audio")
             except Exception as e:
+                self._log_slow_attempt(attempt, start, len(text), e)
                 self._safe_remove(out_path)
                 if attempt == SYNTH_ATTEMPTS - 1:
                     print(f"synth failed after {SYNTH_ATTEMPTS} attempts: {e}",
                           file=sys.stderr)
                 else:
-                    time.sleep(SYNTH_RETRY_SEC)
+                    self._set_tts_state(self.tts_fallback, attempt + 2)
+                    time.sleep(SYNTH_RETRY_SEC * 2 ** attempt)
 
-        self._set_tts_fallback(True)
+        self._set_tts_state(True, 0)
         wav = self._synth_local(text, out_path)
         if wav:
             print("edge-tts unavailable; spoke with local fallback voice",
                   file=sys.stderr)
             return wav, []       # no timings, so the UI highlights the chunk whole
         return None, []
+
+    @staticmethod
+    def _log_slow_attempt(attempt, start, chars, error):
+        """Journal an edge-tts attempt that took SLOW_SYNTH_SEC or longer."""
+        took = time.monotonic() - start
+        if took >= SLOW_SYNTH_SEC:
+            outcome = f"failed: {error}" if error else "ok"
+            print(f"edge-tts attempt {attempt + 1}/{SYNTH_ATTEMPTS}, {chars} chars, "
+                  f"{took:.1f} s, {outcome}", file=sys.stderr)
 
     def _synth_local(self, text, out_path):
         """Render with an offline TTS binary. Returns the wav path, or None."""
@@ -1011,9 +1039,31 @@ class Daemon:
             try:
                 with self.play_lock:
                     self._schedule_tick()
+                    self._update_tts_wait()
             except Exception as e:
                 print(f"scheduler error: {e}", file=sys.stderr)
             time.sleep(TICK_SEC)
+
+    def _update_tts_wait(self):
+        """Tell clients, once a second, how long the speaker has been silent on a chunk edge-tts is still rendering, from SLOW_SYNTH_SEC on."""
+        with self.sessions_lock:
+            sessions = list(self.sessions.values())
+        now = time.monotonic()
+        if any(s.proc is not None and not s.player_paused for s in sessions):
+            self.silent_since = None
+        elif self.silent_since is None:
+            self.silent_since = now
+        wait = 0
+        w = self.synth_wait
+        if w is not None and self.silent_since is not None:
+            sess, start = w
+            waited = now - max(start, self.silent_since)
+            if sess is not None and not sess.paused and not sess.disabled \
+                    and waited >= SLOW_SYNTH_SEC:
+                wait = int(waited)
+        if wait != self.tts_wait:
+            self.tts_wait = wait
+            self.emit_tts()
 
     def _pick_active(self):
         """Return the session that should own the speaker right now (or None)."""
