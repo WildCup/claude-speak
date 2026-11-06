@@ -49,4 +49,4 @@ The daemon pushes `sessions`, `config` and `tts` to every client on connect, and
 
 ## Platform seams
 
-Linux only. Everything platform-specific lives in three places, and it stays there: `SOCKET_PATH` and the control socket (`AF_UNIX`), the mpv IPC transport (`_MpvProc._command`), and `_spawn_player`.
+Linux only. Everything platform-specific lives in four places, and it stays there: `SOCKET_PATH` and the control socket (`AF_UNIX`), the mpv IPC transport (`_MpvProc._command`), `_spawn_player`, and the process check against `/proc` (`_is_running`).

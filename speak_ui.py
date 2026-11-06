@@ -173,6 +173,47 @@ class SlimScroll(tk.Canvas):
         self.create_rectangle(x0, y0 + r, x1, y1 - r, fill=self.fill, outline=self.fill)
 
 
+class TabTip:
+    """The full name of a tab, shown below it while the pointer rests on it."""
+
+    TAG = "TabTip"                  #bindtag every pill carries
+    DELAY_MS = 400                  #rest this long on a tab before its name shows
+
+    def __init__(self, root, font):
+        self.root = root
+        self.font = font
+        self.win = None
+        self.job = None
+        root.bind_class(self.TAG, "<Enter>", self._arm)
+        root.bind_class(self.TAG, "<Leave>", lambda e: self.hide())
+
+    def hide(self):
+        """Take the name down, or cancel one still waiting to show."""
+        if self.job is not None:
+            self.root.after_cancel(self.job)
+            self.job = None
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+
+    def _arm(self, ev):
+        self.hide()
+        self.job = self.root.after(self.DELAY_MS, lambda: self._show(ev.widget))
+
+    def _show(self, pill):
+        self.job = None
+        win = self.win = tk.Toplevel(self.root, bg=BORDER)
+        win.withdraw()                  #mapped only once placed, or it flashes at the screen's corner
+        win.overrideredirect(True)
+        tk.Label(win, text=pill._tip, font=self.font, bg=CARD, fg=INK,
+                 padx=8, pady=4).pack(padx=1, pady=1)
+        win.update_idletasks()
+        #a long name on a right-hand tab would run off the screen
+        x = min(pill.winfo_rootx(), win.winfo_screenwidth() - win.winfo_reqwidth())
+        win.geometry(f"+{x}+{pill.winfo_rooty() + pill.winfo_height() + 4}")
+        win.deiconify()
+
+
 class SpeakUI:
     TOP_PAD = 16                        # the top row's vertical packing pads
 
@@ -259,6 +300,7 @@ class SpeakUI:
 
         self.tabstrip = tk.Frame(top, bg=BG)
         self.tabstrip.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.tip = TabTip(self.root, self.f_status)
 
         # Pack the fixed strips (status, transport) from the bottom FIRST, so the
         # reading card's expand=True only claims the leftover middle — otherwise the
@@ -418,9 +460,19 @@ class SpeakUI:
     # ─── tab strip ──────────────────────────────────────────────────────────────
 
     def _rebuild_tabs(self):
-        for w in self.tabstrip.winfo_children():
-            w.destroy()
-        self.pills = {}
+        #pills are only recreated when tabs open or close, so a state change keeps the hovered one and its name
+        if list(self.pills) != self.order:
+            self.tip.hide()
+            for w in self.tabstrip.winfo_children():
+                w.destroy()
+            self.pills = {}
+            for sid in self.order:
+                pill = tk.Label(self.tabstrip, font=self.f_pill,
+                                padx=PILL_PADX, pady=6, cursor="hand2")
+                pill.bindtags((TabTip.TAG,) + pill.bindtags())
+                pill.pack(side=tk.LEFT, padx=(0, TAB_GAP))
+                pill.bind("<Button-1>", lambda e, x=sid: self._select(x, user=True))
+                self.pills[sid] = pill
         # a project name alone names the tab; only sessions sharing one need more
         counts = {}
         for sid in self.order:
@@ -429,18 +481,16 @@ class SpeakUI:
         for sid in self.order:
             s = self.sessions.get(sid, {})
             label = s.get("label") or sid[:8]
+            title = s.get("title")
+            pill = self.pills[sid]
+            pill._tip = f"{label}: {title}" if title else label
             if counts.get(label, 0) > 1:
-                label = f"{label}: {s.get('title') or sid[:4]}"
+                label = f"{label}: {title or sid[:4]}"
             dot = {"playing": "● ", "paused": "❚❚ ", "disabled": "⊘ ",
                    "ended": "", "idle": ""}.get(s.get("state"), "")
-            pill = tk.Label(self.tabstrip, text=dot + label, font=self.f_pill,
-                            padx=PILL_PADX, pady=6, cursor="hand2")
+            pill.configure(text=dot + label)
             pill._dot = dot
             pill._full = label
-            pill.pack(side=tk.LEFT, padx=(0, TAB_GAP))
-            pill.bind("<Button-1>", lambda e, x=sid: self._select(x, user=True))
-            pill.bind("<Button-3>", lambda e, x=sid: self._tab_menu(e, x))
-            self.pills[sid] = pill
         self._paint_pills()
         self._fit_tabs()
 
@@ -505,18 +555,6 @@ class SpeakUI:
                 talking = self.sessions.get(sid, {}).get("state") == "playing"
                 pill.configure(bg=PILL_BG, fg=ACCENT if talking else INK)
                 self._hover(pill, PILL_BG, PILL_HI)
-
-    def _tab_menu(self, event, sid):
-        m = dark_menu(self.root)
-        m.add_command(label="Close tab", command=lambda: self._close(sid))
-        try:
-            m.tk_popup(event.x_root, event.y_root)
-        finally:
-            m.grab_release()
-
-    def _close(self, sid):
-        self.send("close", sid)
-        self.view.pop(sid, None)
 
     def _select(self, sid, user=False):
         if sid not in self.sessions:
@@ -728,6 +766,7 @@ class SpeakUI:
         sess = ev.get("sessions", [])
         self.sessions = {s["sid"]: s for s in sess}
         self.order = [s["sid"] for s in sess]
+        self.view = {sid: v for sid, v in self.view.items() if sid in self.sessions}
         self.muted_all = bool(ev.get("muted_all"))
         self._paint_stopall()
         if self.selected not in self.sessions:

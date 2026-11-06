@@ -5,7 +5,8 @@ with a Unix-socket control channel for per-session pause / resume / skip / stop 
 repeat, and word-level timing streamed to the UI for live highlighting.
 
 Architecture:
-    watcher thread   -> discovers JSONL files, tails them, enqueues Utterances
+    watcher thread   -> keeps one session per running Claude Code process, tails its
+                        JSONL log, enqueues Utterances
     synth worker     -> Utterance -> edge-tts mp3 + WordBoundary timings -> PlayItem,
                         routed into the owning session's own play queue
     scheduler thread -> plays one session at a time (the "active" session), with
@@ -45,6 +46,7 @@ import speak_engine  # noqa: E402  (text cleaning + chunking + fallback playback
 import edge_tts      # noqa: E402  (used directly for WordBoundary timings)
 
 CLAUDE_PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+CLAUDE_SESSIONS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "sessions")   #one <pid>.json per running claude
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.json")
 
@@ -54,8 +56,6 @@ DEFAULT_CONFIG = {
     "volume": 100,
 }
 
-# Only actively tail files touched within this window (keeps stat load bounded).
-ACTIVE_WINDOW_SEC = 2 * 60 * 60
 POLL_SEC = 1.0
 RESCAN_SEC = 3.0
 TICK_SEC = 0.04
@@ -63,8 +63,6 @@ TICK_SEC = 0.04
 # A session's title record is rewritten every few turns, so the newest one sits
 # near the end of the file — but a file-history snapshot line can be megabytes.
 TITLE_TAIL_BYTES = 1 << 20
-# The opening records (mode, permissions, snapshots) carry no cwd.
-LABEL_HEAD_LINES = 40
 
 # edge-tts is a network call and rejects very long inputs. Retry transient
 # failures, then fall back to a local voice so a message is never silently lost.
@@ -371,7 +369,8 @@ class Daemon:
 
         # sessions keyed by jsonl path
         self.sessions = {}
-        self.closed_paths = set()   # tabs the user closed; never re-register them
+        self.session_files = {}     #~/.claude/sessions file -> what it said when last readable
+        self.awaiting_log = set()   #running sessions with no log yet: once it appears, all of it is new
         self.focus_sid = None       # tab the UI currently shows (for repeat default)
         self.active_sid = None      # session that currently owns the speaker
         self.muted_all = False      # latched "Stop all": new sessions start disabled
@@ -621,35 +620,60 @@ class Daemon:
 
     # ─── watcher ────────────────────────────────────────────────────────────────
 
-    def _discover(self):
-        """Return jsonl paths modified within the active window."""
-        out = []
-        cutoff = time.time() - ACTIVE_WINDOW_SEC
-        try:
-            for d in os.listdir(CLAUDE_PROJECTS_DIR):
-                dp = os.path.join(CLAUDE_PROJECTS_DIR, d)
-                if not os.path.isdir(dp):
-                    continue
-                for f in glob.glob(os.path.join(dp, "*.jsonl")):
-                    try:
-                        if os.path.getmtime(f) >= cutoff:
-                            out.append(f)
-                    except OSError:
-                        continue
-        except OSError:
-            pass
-        return out
+    def _running_sessions(self):
+        """Map the sessionId of every running Claude Code process to its cwd."""
+        running = {}
+        files = glob.glob(os.path.join(CLAUDE_SESSIONS_DIR, "*.json"))
+        for f in files:
+            try:
+                with open(f) as fh:
+                    entry = json.load(fh)
+            except (OSError, ValueError):
+                entry = self.session_files.get(f)   #caught mid-write: keep what it said last
+            if not isinstance(entry, dict):
+                continue
+            self.session_files[f] = entry
+            if _is_running(entry.get("pid"), entry.get("procStart")):
+                running[entry.get("sessionId")] = entry.get("cwd") or ""
+        for f in set(self.session_files) - set(files):
+            del self.session_files[f]
+        return running
 
-    def _register(self, path):
-        """Create a Session for a newly-seen file, starting at end-of-file."""
-        sid = os.path.splitext(os.path.basename(path))[0]
-        label = self._label_for(path)
-        sess = Session(sid, label, path)
+    @staticmethod
+    def _find_log(sid):
+        """The conversation log of a session, or None until its first prompt writes it."""
+        paths = glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*", glob.escape(sid) + ".jsonl"))
+        return paths[0] if paths else None
+
+    def _track_running(self):
+        """Open a tab for every running session that has a log, and close the tabs of
+        sessions that ended. Returns True if the tabs changed."""
+        running = self._running_sessions()
+        with self.sessions_lock:
+            known = {s.sid for s in self.sessions.values()}
+        found = {}
+        for sid in running.keys() - known:
+            path = self._find_log(sid)
+            if path is None:
+                self.awaiting_log.add(sid)
+            else:
+                found[sid] = path
+        with self.sessions_lock:
+            for sid, path in found.items():
+                self._register(sid, path, running[sid], from_start=sid in self.awaiting_log)
+            self.awaiting_log = (self.awaiting_log & running.keys()) - found.keys()
+            removed = self._prune(running)
+        return bool(found) or removed
+
+    def _register(self, sid, path, cwd, from_start):
+        """Create the Session of a running session's log, reading it from its first
+        line or only from what gets written after now."""
+        sess = Session(sid, os.path.basename(cwd.rstrip("/")) or cwd, path)
         sess.title = self._title_for(path) or ""
         self.order_counter += 1
         sess.order_seq = self.order_counter
         try:
-            sess.file_pos = os.path.getsize(path)
+            sess.file_pos = 0 if from_start else os.path.getsize(path)
             sess.identity = os.stat(path).st_ino
         except OSError:
             sess.file_pos = 0
@@ -658,24 +682,6 @@ class Daemon:
             sess.state = "disabled"
         self.sessions[path] = sess
         return sess
-
-    def _label_for(self, path):
-        """Best-effort human label: basename of the cwd recorded in the file."""
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                for _ in range(LABEL_HEAD_LINES):
-                    line = f.readline()
-                    if not line:
-                        break
-                    try:
-                        cwd = json.loads(line).get("cwd")
-                    except (ValueError, json.JSONDecodeError):
-                        continue
-                    if cwd:
-                        return os.path.basename(cwd.rstrip("/")) or cwd
-        except OSError:
-            pass
-        return os.path.basename(os.path.dirname(path))
 
     def _title_for(self, path):
         """The title Claude Code gives the conversation — what its terminal tab
@@ -708,14 +714,7 @@ class Daemon:
                     self.start_epoch = wall
                 if now - last_rescan > RESCAN_SEC:
                     last_rescan = now
-                    found_new = False
-                    for path in self._discover():
-                        with self.sessions_lock:
-                            if path not in self.sessions and path not in self.closed_paths:
-                                self._register(path)
-                                found_new = True
-                    changed_prune = self._prune()
-                    if found_new or changed_prune:
+                    if self._track_running():
                         self.emit_sessions()
 
                 with self.sessions_lock:
@@ -731,38 +730,24 @@ class Daemon:
 
             time.sleep(POLL_SEC)
 
-    def _prune(self):
-        """Drop sessions whose file is gone or has gone quiet, so the UI's tab list
-        tracks live conversations. Never drops one that's busy (playing / paused /
-        queued) or currently focused/active. Returns True if anything was removed."""
-        cutoff = time.time() - ACTIVE_WINDOW_SEC
+    def _prune(self, running):
+        """Close the tab of every session that is no longer running, silencing it, and
+        the clipboard tab once it has finished speaking unpaused. Returns True if any
+        closed."""
         removed = False
         with self.play_lock:
             for path, sess in list(self.sessions.items()):
                 if sess.adhoc:
-                    continue        # ad-hoc tabs live until closed by hand
-                gone = False
-                stale = False
-                try:
-                    stale = os.path.getmtime(path) < cutoff
-                except OSError:
-                    gone = True
-                # being disabled keeps a tab alive only when the user chose that per
-                # session; under a latched Stop all it is merely the default, so those
-                # tabs prune as usual (and come back disabled if the file is still live)
-                busy = (sess.has_work() or sess.state in ("playing", "paused")
-                        or (sess.disabled and not self.muted_all)
-                        or sess.sid == self.active_sid)
-                # a deleted file is definitely dead — prune even if it's the focus;
-                # a merely-quiet (stale) file stays if the UI is focused on it.
-                if not gone and sess.sid == self.focus_sid:
-                    busy = True
-                if (gone or stale) and not busy:
-                    self._drain_session(sess)
-                    self.sessions.pop(path, None)
-                    if self.focus_sid == sess.sid:
-                        self.focus_sid = None
-                    removed = True
+                    done = not sess.paused and not sess.has_work()
+                else:
+                    done = sess.sid not in running
+                if not done:
+                    continue
+                self.cmd_stop(sess.sid)
+                self.sessions.pop(path)
+                if self.focus_sid == sess.sid:
+                    self.focus_sid = None
+                removed = True
         return removed
 
     def _tail(self, sess):
@@ -1441,6 +1426,7 @@ class Daemon:
             return
         label = label or "clipboard"
         key = "<adhoc>:" + label         # not a real path: the watcher skips it
+        #one hold until the text is queued: _prune closes a clipboard tab with nothing to say
         with self.play_lock:
             sess = self.sessions.get(key)
             if sess is None:
@@ -1453,26 +1439,7 @@ class Daemon:
             sess.last_active = time.time()
             self.seq_counter += 1
             msg_id = "_adhoc_%d" % self.seq_counter
-        self._enqueue_message(sess, msg_id, text)
-        self.emit_sessions()
-
-    def cmd_close(self, sid=None):
-        """Close a tab: silence the session and stop tracking it. A file-backed
-        session stays closed for the daemon's lifetime, even if the file grows."""
-        with self.play_lock:
-            sess = self._resolve(sid, prefer_active=False)
-            if not sess:
-                return
-            self.cmd_stop(sess.sid)
-            for path, s in list(self.sessions.items()):
-                if s.sid == sess.sid:
-                    self.sessions.pop(path, None)
-                    if not s.adhoc:
-                        self.closed_paths.add(path)
-            if self.focus_sid == sess.sid:
-                self.focus_sid = None
-            if self.active_sid == sess.sid:
-                self.active_sid = None
+            self._enqueue_message(sess, msg_id, text)
         self.emit_sessions()
 
     def _drain_session(self, sess):
@@ -1586,8 +1553,6 @@ class Daemon:
             self.cmd_focus(sid)
         elif cmd == "speak":
             self.cmd_speak(msg.get("text"), msg.get("label"))
-        elif cmd == "close":
-            self.cmd_close(sid)
         elif cmd == "ping":
             self.emit_sessions()
         elif cmd == "get_config":
@@ -1744,6 +1709,18 @@ class _DummyProc:
 
     def kill(self):
         pass
+
+
+def _is_running(pid, proc_start):
+    """Whether `pid` is still the process that started at `proc_start` (its start
+    time in clock ticks), so a reused pid doesn't count."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return False
+    #the command name may hold spaces, so fields are counted past its closing paren: [19] is starttime
+    return stat.rsplit(")", 1)[1].split()[19] == str(proc_start)
 
 
 def _daemon_is_live():
