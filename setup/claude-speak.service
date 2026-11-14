@@ -3,7 +3,7 @@ Description=Claude Speak TTS Monitor
 After=default.target
 
 [Service]
-ExecStart=%h/code/AI/audio/claude-speak/.venv/bin/python %h/code/AI/audio/claude-speak/speak_daemon.py
+ExecStart=%h/code/claude-speak/.venv/bin/python %h/code/claude-speak/speak_daemon.py
 Restart=on-failure
 RestartSec=5
 Environment=DISPLAY=:0

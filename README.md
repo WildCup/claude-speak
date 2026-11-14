@@ -100,7 +100,7 @@ echo "$(xsel -o)" | .venv/bin/python speak_engine.py
 On GNOME, bind either of those under **Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts → +**. Give it a name, paste the command as
 
 ```
-bash -c 'echo "$(xsel -o)" | ~/code/AI/audio/claude-speak/.venv/bin/python ~/code/AI/audio/claude-speak/speak_engine.py'
+bash -c 'echo "$(xsel -o)" | ~/code/claude-speak/.venv/bin/python ~/code/claude-speak/speak_engine.py'
 ```
 
 and set the key. A custom shortcut runs without a shell, so the `bash -c` wrapper and full paths are both required.
