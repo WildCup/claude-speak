@@ -2,7 +2,7 @@
 """
 speak_daemon: watch all Claude Code conversation logs and speak assistant output,
 with a Unix-socket control channel for per-session pause / resume / skip / stop /
-repeat, and word-level timing streamed to the UI for live highlighting.
+restart, and word-level timing streamed to the UI for live highlighting.
 
 Architecture:
     watcher thread   -> keeps one session per running Claude Code process, tails its
@@ -10,7 +10,7 @@ Architecture:
     synth worker     -> Utterance -> edge-tts mp3 + WordBoundary timings -> PlayItem,
                         routed into the owning session's own play queue
     scheduler thread -> plays one session at a time (the "active" session), with
-                        per-session pause, skip, stop, repeat
+                        per-session pause, skip, stop, restart
     socket server    -> accepts UI/CLI clients, dispatches commands, broadcasts events
 
 Playback model (one speaker, many sessions):
@@ -64,12 +64,13 @@ TICK_SEC = 0.04
 # near the end of the file — but a file-history snapshot line can be megabytes.
 TITLE_TAIL_BYTES = 1 << 20
 
-# edge-tts is a network call and rejects very long inputs. Retry transient
-# failures, then fall back to a local voice so a message is never silently lost.
+#edge-tts is a network call and rejects very long inputs. Retry failures until the voice waits on the paragraph,
+#then fall back to a local voice so a message is never silently lost.
 MAX_SYNTH_CHARS = 3000
-SYNTH_ATTEMPTS = 3
+SYNTH_ATTEMPTS = 3          #failed attempts before a paragraph the voice waits on falls back
 SYNTH_RETRY_SEC = 1.0       #first gap; doubles each retry, since edge-tts fails in bursts
-SLOW_SYNTH_SEC = 2.0        #a wait or attempt this long shows in the UI and the journal
+SYNTH_RETRY_MAX_SEC = 4.0   #longest gap between retries
+SLOW_SYNTH_SEC = 2.0        #a render this long turns the UI's status orange; an attempt this long is journaled
 
 
 def now_ms():
@@ -190,18 +191,25 @@ class Channel:
             self._dq.append(item)
             self._cv.notify()
 
-    def put_front(self, item):
+    def put_front(self, items):
+        """Queue items ahead of everything waiting, keeping their order."""
         with self._cv:
-            self._dq.appendleft(item)
+            self._dq.extendleft(reversed(items))
             self._cv.notify()
 
-    def get(self, timeout=0.5):
+    def get(self, timeout=0.5, prefer=None):
+        """Take the oldest item prefer accepts, else the oldest of all. None if nothing arrives within timeout."""
         with self._cv:
             if not self._dq and not self._closed:
                 self._cv.wait(timeout)
-            if self._dq:
-                return self._dq.popleft()
-            return None
+            if not self._dq:
+                return None
+            if prefer is not None:
+                for i, item in enumerate(self._dq):
+                    if prefer(item):
+                        del self._dq[i]
+                        return item
+            return self._dq.popleft()
 
     def drop_where(self, pred):
         """Remove all queued items matching pred. Returns how many were dropped."""
@@ -218,34 +226,55 @@ class Channel:
             self._cv.notify_all()
 
 
-class Utterance:
-    __slots__ = ("session", "msg_id", "seq", "text", "full", "gen", "tok", "idx")
+class Message:
+    """One assistant message, split into the paragraphs it is spoken in."""
+    __slots__ = ("chunks", "clean", "rank")
 
-    def __init__(self, session, msg_id, seq, text, full, gen, tok, idx):
+    def __init__(self, chunks, rank):
+        self.chunks = chunks    #raw paragraph texts
+        self.clean = [speak_engine.clean_text(c, skip_code=True, skip_paths=True)
+                      for c in chunks]      #what is spoken and what the UI shows
+        self.rank = rank        #a session speaks its messages in rank order, lowest first
+
+
+class Utterance:
+    __slots__ = ("session", "msg_id", "seq", "msg", "gen", "tok", "idx")
+
+    def __init__(self, session, msg_id, seq, msg, gen, tok, idx):
         self.session = session
         self.msg_id = msg_id
         self.seq = seq
-        self.text = text        # this chunk
-        self.full = full        # whole message text (for restart)
+        self.msg = msg          #the Message this chunk belongs to
         self.gen = gen          # global generation (stop_all)
-        self.tok = tok          # per-session token (per-session stop/replay)
+        self.tok = tok          #per-session token (per-session stop / disable)
         self.idx = idx          # this chunk's position within the message
+
+    @property
+    def order(self):
+        """Where this chunk is spoken among its session's chunks."""
+        return self.msg.rank, self.idx
 
 
 class PlayItem:
-    __slots__ = ("session", "msg_id", "seq", "text", "full", "path", "words",
-                 "gen", "idx")
+    __slots__ = ("session", "msg_id", "seq", "text", "msg", "path", "words",
+                 "gen", "idx", "fallback")
 
-    def __init__(self, session, msg_id, seq, text, full, path, words, gen, idx):
+    def __init__(self, session, msg_id, seq, text, msg, path, words, gen, idx, fallback):
         self.session = session
         self.msg_id = msg_id
         self.seq = seq
         self.text = text
-        self.full = full
+        self.msg = msg
         self.path = path
         self.words = words
         self.gen = gen
         self.idx = idx
+        self.fallback = fallback    #name of the fallback voice that rendered it, None for edge-tts
+
+    @property
+    def order(self):
+        """Where this chunk is spoken among its session's chunks."""
+        return self.msg.rank, self.idx
 
 
 # ─── Session bookkeeping ───────────────────────────────────────────────────────
@@ -269,21 +298,17 @@ class Session:
         self._pause_started = None       # monotonic time the player went quiet
         self.pause_accum = 0.0           # silent seconds inside the current chunk
         self.paused = False              # user paused this session
-        self.inflight = 0                # utterances queued to synth, not yet in q
-        self.gen_token = 0               # bumped by this session's stop/replay
+        self.inflight = set()            #utterances queued to synth, not yet in q
+        self.gen_token = 0               #bumped by this session's stop / disable
         self.pending_since = 0.0         # when this session first had work waiting
-        self.playing_msg_id = None       # msg_id of the message on the speaker now
-        self.played = False              # has this session ever spoken a chunk?
+        self.msg_id = None               #msg_id of msg's chunks still to say: what Skip drops
         self.disabled = False            # muted for ALL future output until re-enabled
         self.order_seq = 0               # stable tab order (discovery order)
         self.state = "idle"              # idle | playing | paused | ended | disabled
         self.adhoc = False               # ad-hoc tab (piped text), not a jsonl file
 
-        # current message, for paragraph navigation (Repeat) and whole (Restart)
-        self.msg_chunks = []             # ordered chunk texts of the current message
-        self.msg_clean = []              # same chunks, cleaned — what the UI displays
-        self.msg_full = None             # its full text
-        self.cur_idx = 0                 # chunk index currently playing / last played
+        self.msg = None                  #current Message: the one being spoken, else the next one waiting; the card shows it and clicks and Skip act on it
+        self.newest = None               #the last Message Claude wrote here: what Restart reads
         self.cur_started = 0.0           # monotonic time the current chunk began
 
     @property
@@ -320,10 +345,22 @@ class Session:
         return max(0.0, (time.monotonic() - self.cur_started - silent) * 1000.0)
 
     def can_replay(self):
-        return self.played and bool(self.msg_chunks)
+        return self.msg is not None
 
     def has_work(self):
-        return self.cur is not None or bool(self.q) or self.inflight > 0
+        return self.cur is not None or bool(self.q) or bool(self.inflight)
+
+    def queue_clip(self, item):
+        """Add a rendered chunk to q in speaking order."""
+        at = len(self.q)
+        while at and self.q[at - 1].order > item.order:
+            at -= 1
+        self.q.insert(at, item)
+
+    def can_play_next(self):
+        """Whether q's first chunk may play: no chunk spoken before it is still rendering."""
+        first = self.q[0].order
+        return all(u.order > first for u in self.inflight)
 
 
 # ─── The daemon ────────────────────────────────────────────────────────────────
@@ -345,17 +382,16 @@ class Daemon:
         self._preview_proc = None
         self._preview_gen = 0           # newest preview wins; older ones drop their audio
         self._preview_lock = threading.Lock()
-        self.tts_fallback = False       # is edge-tts failing, so espeak speaks instead?
         self.tts_retry = 0              #edge-tts attempt being waited for, 0 when not retrying
-        self.tts_wait = 0               #whole seconds the speaker has been silent on a slow render
-        self.synth_wait = None          #(session, start) of the chunk the synth worker renders
-        self.silent_since = None        #when the speaker last went quiet
+        self.rendering = None           #(utterance, start) the synth worker is on, None while idle
+        self._renders_sent = None       #what the last tts event said about each tab
 
         self.synth_chan = Channel()
         self.temp_dir = tempfile.mkdtemp(prefix="claude_speak_")
         self.file_counter = 0
         self.seq_counter = 0
         self.order_counter = 0          # assigns each session a stable display order
+        self.msg_ranks = itertools.count()  #ranks messages in the order they arrive
 
         # dedup of spoken message ids (bounded)
         self._spoken = collections.OrderedDict()
@@ -371,7 +407,7 @@ class Daemon:
         self.sessions = {}
         self.session_files = {}     #~/.claude/sessions file -> what it said when last readable
         self.awaiting_log = set()   #running sessions with no log yet: once it appears, all of it is new
-        self.focus_sid = None       # tab the UI currently shows (for repeat default)
+        self.focus_sid = None       #tab the UI shows: commands without a sid fall back to it, and its paragraphs render first
         self.active_sid = None      # session that currently owns the speaker
         self.muted_all = False      # latched "Stop all": new sessions start disabled
 
@@ -462,11 +498,16 @@ class Daemon:
                     self.clients.remove(conn)
 
     def emit_playing(self, conn):
-        """Catch a just-connected client up on what is already on the speaker."""
-        with self.sessions_lock:
-            sessions = list(self.sessions.values())
+        """Catch a just-connected client up on what is already on the speaker, and on current messages still waiting to start."""
+        events = []
         with self.play_lock:
-            events = [self._play_event(s) for s in sessions if s.cur is not None]
+            for s in self.sessions.values():
+                if s.cur is not None:
+                    events.append(self._play_event(s))
+                    continue
+                first = self._find_first_waiting(s)
+                if first is not None and first.msg_id == s.msg_id:
+                    events.append(self._current_event(s, first.idx))
         for ev in events:
             self.send(conn, ev)
 
@@ -503,13 +544,56 @@ class Daemon:
     def emit_config(self):
         self.broadcast({"ev": "config", "config": self.current_config()})
 
-    def emit_tts(self):
-        self.broadcast({"ev": "tts", "fallback": self.tts_fallback, "wait": self.tts_wait,
-                        "retry": self.tts_retry, "attempts": SYNTH_ATTEMPTS})
+    def emit_tts(self, renders=None):
+        """Tell clients what the renderer is doing for each tab. A tab's `rendering` is how many seconds the render it waits on has taken so far."""
+        with self.play_lock:
+            renders = self._summarize_renders() if renders is None else renders
+            self._renders_sent = renders
+            now = time.monotonic()
+            tabs = {}
+            for sid, (ready, total, nxt, started, fallback) in renders.items():
+                rendering = None
+                if nxt == "rendering":
+                    rendering = 0.0 if started is None else now - started
+                tabs[sid] = {"ready": ready, "total": total, "next": nxt,
+                             "rendering": rendering, "fallback": fallback}
+            self.broadcast({"ev": "tts", "retry": self.tts_retry,
+                            "slow": SLOW_SYNTH_SEC, "tabs": tabs})
 
-    def _set_tts_state(self, fallback, retry):
-        if (self.tts_fallback, self.tts_retry) != (fallback, retry):
-            self.tts_fallback, self.tts_retry = fallback, retry
+    def _update_tts(self):
+        """Tell clients when a tab's render status changed."""
+        renders = self._summarize_renders()
+        if renders != self._renders_sent:
+            self.emit_tts(renders)
+
+    def _summarize_renders(self):
+        """Each session's (ready, total, next, started, fallback): how many paragraphs in a row are rendered from the one on the speaker, out of all it has left; what the one after them is doing ("rendering", "queued" behind another render, None when nothing is left) and when its render began; and the fallback voice the one on the speaker was rendered with, or None."""
+        out = {}
+        with self.play_lock:
+            r = self.rendering
+            for s in self.sessions.values():
+                pending = min(s.inflight, key=lambda u: u.order, default=None)
+                ready = int(s.cur is not None)
+                for item in s.q:
+                    if pending is not None and pending.order < item.order:
+                        break
+                    ready += 1
+                total = int(s.cur is not None) + len(s.q) + len(s.inflight)
+                fallback = s.cur.fallback if s.cur is not None else None
+                if pending is None:
+                    nxt, started = None, None
+                elif r is None:
+                    nxt, started = "rendering", None    #between chunks: the worker takes one right away
+                elif r[0] is pending:
+                    nxt, started = "rendering", r[1]
+                else:
+                    nxt, started = "queued", None
+                out[s.sid] = (ready, total, nxt, started, fallback)
+        return out
+
+    def _set_retry(self, retry):
+        if retry != self.tts_retry:
+            self.tts_retry = retry
             self.emit_tts()
 
     def cmd_set_config(self, msg):
@@ -584,8 +668,8 @@ class Daemon:
                 with self.play_lock:
                     self.file_counter += 1
                     out = os.path.join(self.temp_dir, f"prev{self.file_counter}.mp3")
-                path, _ = self._render(loop, text, voice, out, rate=rate,
-                                       stale=lambda: gen != self._preview_gen)
+                path, _, _ = self._render(loop, text, voice, out, rate=rate,
+                                          stale=lambda: gen != self._preview_gen)
                 if not path:
                     if gen == self._preview_gen:    #a superseded preview isn't a failure
                         self.broadcast({"ev": "preview", "ok": False})
@@ -870,25 +954,26 @@ class Daemon:
         chunks = cap_chunks(speak_engine.extract_speakable_chunks(full_text))
         if not chunks:
             return
+        msg = Message(chunks, next(self.msg_ranks))
         with self.play_lock:
-            sess.msg_chunks = chunks       # remembered for Repeat / Previous / Restart
-            # the UI shows these while audio for a seek target is still synthesizing,
-            # so they must match what _synth_worker will eventually speak
-            sess.msg_clean = [speak_engine.clean_text(c, skip_code=True, skip_paths=True)
-                              for c in chunks]
-            sess.msg_full = full_text
-        self._enqueue_chunks(sess, msg_id, chunks, full_text, 0)
+            sess.newest = msg
+        self._enqueue_chunks(sess, msg_id, msg, 0)
 
-    def _enqueue_chunks(self, sess, msg_id, chunks, full_text, start_idx):
-        """Queue chunks[start_idx:] for synthesis, preserving their message index."""
-        for i in range(start_idx, len(chunks)):
-            self.seq_counter += 1
-            with self.play_lock:
-                sess.inflight += 1
-                tok = sess.gen_token
-            self.synth_chan.put(
-                Utterance(sess.sid, msg_id, self.seq_counter, chunks[i], full_text,
-                          self.generation, tok, i))
+    def _enqueue_chunks(self, sess, msg_id, msg, start_idx, first=False):
+        """Queue msg's chunks from start_idx on for synthesis, ahead of all other waiting work when first."""
+        batch = []
+        with self.play_lock:
+            for i in range(start_idx, len(msg.chunks)):
+                self.seq_counter += 1
+                u = Utterance(sess.sid, msg_id, self.seq_counter, msg,
+                              self.generation, sess.gen_token, i)
+                sess.inflight.add(u)
+                batch.append(u)
+        if first:
+            self.synth_chan.put_front(batch)
+        else:
+            for u in batch:
+                self.synth_chan.put(u)
 
     # ─── synth worker ───────────────────────────────────────────────────────────
 
@@ -896,109 +981,135 @@ class Daemon:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         while self.running:
-            u = self.synth_chan.get()
+            u = self.synth_chan.get(prefer=lambda x: x.session == self.focus_sid)
             if u is None:
                 continue
             sess = self._session_by_sid(u.session)
+            with self.play_lock:
+                self.rendering = (u, time.monotonic())
             try:
                 if self._is_cancelled(u):
                     continue
-                cleaned = speak_engine.clean_text(u.text, skip_code=True, skip_paths=True)
+                cleaned = u.msg.clean[u.idx]
                 if not cleaned.strip() or len(cleaned.split()) < 3:
                     continue
                 self.file_counter += 1
                 out = os.path.join(self.temp_dir, f"s{self.file_counter}.mp3")
-                self.synth_wait = (sess, time.monotonic())
-                out, words = self._render(
+                out, words, fallback = self._render(
                     loop, cleaned, self.voice, out,
-                    stale=lambda: self._is_cancelled(u) or (
-                        sess is not None and u.tok != sess.gen_token))
+                    #a closed session's chunk is stale too, or it would retry forever
+                    stale=lambda: sess is None or self._is_cancelled(u) or u.tok != sess.gen_token,
+                    urgent=lambda: self._voice_waits_on(sess, u))
                 if self._is_cancelled(u):       # stopped while we were synthesizing
                     self._safe_remove(out)
                     continue
                 if out and sess is not None:
-                    item = PlayItem(u.session, u.msg_id, u.seq, cleaned, u.full,
-                                    out, words, u.gen, u.idx)
+                    item = PlayItem(u.session, u.msg_id, u.seq, cleaned, u.msg,
+                                    out, words, u.gen, u.idx, fallback)
                     with self.play_lock:
-                        if u.tok != sess.gen_token:     # session stopped/replayed since
+                        if u.tok != sess.gen_token:     #session stopped or disabled since
                             self._safe_remove(out)
                         else:
                             if not sess.q and sess.cur is None:
                                 sess.pending_since = time.monotonic()
-                            sess.q.append(item)
+                            sess.queue_clip(item)
             except Exception as e:
                 print(f"synth error: {e}", file=sys.stderr)
             finally:
-                self.synth_wait = None
-                if sess is not None:
-                    with self.play_lock:
-                        sess.inflight = max(0, sess.inflight - 1)
+                with self.play_lock:            #one step, so no status sees it done but still rendering
+                    self.rendering = None
+                    if sess is not None:
+                        sess.inflight.discard(u)
 
-    def _render(self, loop, text, voice, out_path, rate=None, stale=None):
-        """Synthesize `text` to an audio file, returning (path, word_timings).
+    def _voice_waits_on(self, sess, u):
+        """Whether sess has nothing rendered to play before u, so its voice waits on u's render."""
+        with self.play_lock:
+            return sess.cur is None and all(
+                x.order >= u.order for x in itertools.chain(sess.q, sess.inflight))
 
-        edge-tts is a network call, so transient failures are retried before
-        falling back to a local voice — otherwise a dropped request means the
-        message is silently never spoken. Returns (None, []) if nothing rendered,
-        or as soon as `stale()` says the result is no longer wanted.
+    def _render(self, loop, text, voice, out_path, rate=None, stale=None, urgent=None):
+        """Synthesize `text` to an audio file, returning (path, word_timings, fallback).
+
+        A failed edge-tts attempt is retried, with growing gaps, until SYNTH_ATTEMPTS have failed and `urgent()` says the voice waits on the result (always, without `urgent`). Then the local fallback voice renders it and `fallback` names that voice. Returns (None, [], None) if nothing rendered, or as soon as `stale()` says the result is no longer wanted.
         """
         rate = self.rate if rate is None else rate
-        for attempt in range(SYNTH_ATTEMPTS):
+        urgent = urgent or (lambda: True)
+        failed = 0
+        while True:
             if not self.running or (stale and stale()):
-                self._set_tts_state(self.tts_fallback, 0)
-                return None, []
+                self._set_retry(0)
+                return None, [], None
+            if failed >= SYNTH_ATTEMPTS and urgent():
+                break
             start = time.monotonic()
             try:
                 words = loop.run_until_complete(
-                    self._synth(text, voice, rate, out_path))
+                    self._synth_until_stale(text, voice, rate, out_path, stale))
+                if words is None:
+                    self._safe_remove(out_path)
+                    continue            #stale: the loop's first check returns
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    self._log_slow_attempt(attempt, start, len(text), None)
-                    self._set_tts_state(False, 0)
-                    return out_path, words
+                    self._log_slow_attempt(failed + 1, start, len(text), None)
+                    self._set_retry(0)
+                    return out_path, words, None
                 raise RuntimeError("edge-tts returned no audio")
             except Exception as e:
-                self._log_slow_attempt(attempt, start, len(text), e)
+                self._log_slow_attempt(failed + 1, start, len(text), e)
                 self._safe_remove(out_path)
-                if attempt == SYNTH_ATTEMPTS - 1:
-                    print(f"synth failed after {SYNTH_ATTEMPTS} attempts: {e}",
-                          file=sys.stderr)
-                else:
-                    self._set_tts_state(self.tts_fallback, attempt + 2)
-                    time.sleep(SYNTH_RETRY_SEC * 2 ** attempt)
+                failed += 1
+            self._set_retry(failed + 1)
+            #the gap ends early once the result is stale or the fallback is due
+            gap_end = time.monotonic() + min(SYNTH_RETRY_SEC * 2 ** (failed - 1), SYNTH_RETRY_MAX_SEC)
+            while time.monotonic() < gap_end and self.running and not (stale and stale()) \
+                    and not (failed >= SYNTH_ATTEMPTS and urgent()):
+                time.sleep(0.1)
 
-        self._set_tts_state(True, 0)
-        wav = self._synth_local(text, out_path)
+        self._set_retry(0)
+        wav, name = self._synth_local(text, out_path)
         if wav:
-            print("edge-tts unavailable; spoke with local fallback voice",
-                  file=sys.stderr)
-            return wav, []       # no timings, so the UI highlights the chunk whole
-        return None, []
+            print(f"edge-tts failed {failed} times; spoke with {name}", file=sys.stderr)
+            return wav, [], name     # no timings, so the UI highlights the chunk whole
+        return None, [], None
 
     @staticmethod
     def _log_slow_attempt(attempt, start, chars, error):
-        """Journal an edge-tts attempt that took SLOW_SYNTH_SEC or longer."""
+        """Journal an edge-tts attempt (numbered from 1) that took SLOW_SYNTH_SEC or longer."""
         took = time.monotonic() - start
         if took >= SLOW_SYNTH_SEC:
             outcome = f"failed: {error}" if error else "ok"
-            print(f"edge-tts attempt {attempt + 1}/{SYNTH_ATTEMPTS}, {chars} chars, "
+            print(f"edge-tts attempt {attempt}, {chars} chars, "
                   f"{took:.1f} s, {outcome}", file=sys.stderr)
 
     def _synth_local(self, text, out_path):
-        """Render with an offline TTS binary. Returns the wav path, or None."""
+        """Render with an offline TTS binary. Returns (wav path, binary name), or (None, None)."""
         espeak = shutil.which("espeak-ng") or shutil.which("espeak")
         if not espeak:
-            return None
+            return None, None
         wav = os.path.splitext(out_path)[0] + ".wav"
         try:
             subprocess.run([espeak, "-w", wav, text],
                            check=True, capture_output=True, timeout=120)
         except (subprocess.SubprocessError, OSError):
             self._safe_remove(wav)
-            return None
+            return None, None
         if os.path.exists(wav) and os.path.getsize(wav) > 0:
-            return wav
+            return wav, os.path.basename(espeak)
         self._safe_remove(wav)
-        return None
+        return None, None
+
+    async def _synth_until_stale(self, text, voice, rate, out_path, stale):
+        """Run _synth, abandoning it as soon as stale() says its result is no longer wanted. Returns its word timings, or None once abandoned."""
+        task = asyncio.ensure_future(self._synth(text, voice, rate, out_path))
+        while not task.done():
+            await asyncio.wait({task}, timeout=0.1)
+            if not task.done() and stale and stale():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                return None
+        return task.result()
 
     async def _synth(self, text, voice, rate, out_path):
         """edge-tts streaming: write audio + collect word timings (ms)."""
@@ -1023,32 +1134,36 @@ class Daemon:
         while self.running:
             try:
                 with self.play_lock:
+                    for s in list(self.sessions.values()):
+                        self._advance_current(s)
                     self._schedule_tick()
-                    self._update_tts_wait()
+                    self._update_tts()
             except Exception as e:
                 print(f"scheduler error: {e}", file=sys.stderr)
             time.sleep(TICK_SEC)
 
-    def _update_tts_wait(self):
-        """Tell clients, once a second, how long the speaker has been silent on a chunk edge-tts is still rendering, from SLOW_SYNTH_SEC on."""
-        with self.sessions_lock:
-            sessions = list(self.sessions.values())
-        now = time.monotonic()
-        if any(s.proc is not None and not s.player_paused for s in sessions):
-            self.silent_since = None
-        elif self.silent_since is None:
-            self.silent_since = now
-        wait = 0
-        w = self.synth_wait
-        if w is not None and self.silent_since is not None:
-            sess, start = w
-            waited = now - max(start, self.silent_since)
-            if sess is not None and not sess.paused and not sess.disabled \
-                    and waited >= SLOW_SYNTH_SEC:
-                wait = int(waited)
-        if wait != self.tts_wait:
-            self.tts_wait = wait
-            self.emit_tts()
+    def _advance_current(self, sess):
+        """Turn a session to the next message waiting once nothing of its current one is left to say, and show it on clients' cards."""
+        if sess.cur is not None:
+            return
+        first = self._find_first_waiting(sess)
+        if first is None or first.msg_id == sess.msg_id:
+            return
+        if any(x.msg_id == sess.msg_id for x in itertools.chain(sess.q, sess.inflight)):
+            return                      #the current message still has chunks to come
+        sess.msg, sess.msg_id = first.msg, first.msg_id
+        self.broadcast(self._current_event(sess, first.idx))
+        self.emit_sessions()
+
+    @staticmethod
+    def _find_first_waiting(sess):
+        """The rendered or still rendering chunk a session speaks next, or None."""
+        return min(itertools.chain(sess.q, sess.inflight), key=lambda x: x.order, default=None)
+
+    @staticmethod
+    def _current_event(sess, idx):
+        """The `current` event for a session's message before it starts speaking: its paragraphs, and idx, the one it speaks first."""
+        return {"ev": "current", "sid": sess.sid, "chunks": list(sess.msg.clean), "idx": idx}
 
     def _pick_active(self):
         """Return the session that should own the speaker right now (or None)."""
@@ -1060,11 +1175,9 @@ class Daemon:
             s = by_sid.get(self.active_sid)
             # keep the speaker only while the active session is live and unblocked;
             # a paused or disabled session RELEASES it so other tabs can play.
-            if s and not s.paused and not s.disabled \
-                    and (s.cur is not None or s.q or s.inflight > 0):
+            if s and not s.paused and not s.disabled and s.has_work():
                 return s
-            if s is not None and s.state == "playing" \
-                    and not (s.cur is not None or s.q or s.inflight > 0):
+            if s is not None and s.state == "playing" and not s.has_work():
                 self._set_state(s, "ended")     # drained: nothing left to say
             self.active_sid = None
 
@@ -1086,6 +1199,8 @@ class Daemon:
         # need a current chunk?
         if sess.cur is None:
             if sess.q:
+                if not sess.can_play_next():
+                    return
                 item = sess.q.popleft()
                 if self._is_cancelled(item):
                     self._safe_remove(item.path)
@@ -1095,7 +1210,7 @@ class Daemon:
                 sess.player_paused = False
             else:
                 # nothing left to play for this session right now
-                if sess.inflight == 0 and sess.state == "playing":
+                if not sess.inflight and sess.state == "playing":
                     self._set_state(sess, "ended")
                     if self.active_sid == sess.sid and not sess.paused:
                         self.active_sid = None
@@ -1129,10 +1244,9 @@ class Daemon:
 
     def _start_proc(self, sess):
         item = sess.cur
-        sess.playing_msg_id = item.msg_id
-        sess.cur_idx = item.idx                  # where we are in the message
+        sess.msg_id = item.msg_id
+        sess.msg = item.msg
         sess.start_clock()
-        sess.played = True
         proc = self._spawn_player(item.path)
         sess.proc = proc
         sess.player_paused = False
@@ -1152,7 +1266,7 @@ class Daemon:
             "idx": item.idx,
             "text": item.text,
             "words": item.words,
-            "chunks": list(sess.msg_clean),   # lets the UI jump paragraphs instantly
+            "chunks": list(item.msg.clean),   # lets the UI jump paragraphs instantly
             "epoch_ms": now_ms(),
             "elapsed_ms": sess.elapsed_ms(),
             "paused": sess.player_paused,
@@ -1227,15 +1341,7 @@ class Daemon:
                 return
             sess.paused = False
             if sess.has_work():
-                # switching speaker: pause whoever holds it now
-                if self.active_sid and self.active_sid != sess.sid:
-                    other = self._session_by_sid(self.active_sid)
-                    if other and other.proc is not None and not other.player_paused:
-                        other.paused = True
-                        other.proc.pause()
-                        other.player_paused = True
-                        self._set_state(other, "paused")
-                self.active_sid = sess.sid
+                self._take_speaker(sess)
                 if sess.proc is not None and sess.player_paused:
                     sess.proc.resume()
                     sess.player_paused = False
@@ -1243,6 +1349,18 @@ class Daemon:
             else:
                 self._set_state(sess, "ended" if sess.can_replay() else "idle")
         self.broadcast({"ev": "resume", "sid": sess.sid})
+
+    def _take_speaker(self, sess):
+        """Make sess the active speaker, pausing the session that is talking now where it stands."""
+        if self.active_sid and self.active_sid != sess.sid:
+            other = self._session_by_sid(self.active_sid)
+            if other and other.proc is not None and not other.player_paused:
+                other.paused = True
+                other.proc.pause()
+                other.player_paused = True
+                self._set_state(other, "paused")
+                self.broadcast({"ev": "pause", "sid": other.sid})
+        self.active_sid = sess.sid
 
     def cmd_toggle(self, sid=None):
         sess = self._resolve(sid, prefer_active=True)
@@ -1254,13 +1372,16 @@ class Daemon:
             self.cmd_pause(sess.sid)
 
     def cmd_skip(self, sid=None):
-        """Stop the current chunk only; the next queued chunk plays."""
+        """Drop the rest of a session's current message, whether it is speaking or still waiting to. The next message it has waiting plays, unless the session is paused."""
         with self.play_lock:
             sess = self._resolve(sid, prefer_active=True)
-            if not sess or sess.proc is None:
+            if not sess:
                 return
-            self._kill(sess.proc)
-            # the scheduler will observe the finished proc and advance
+            cur = sess.cur
+            self._drop_current(sess)
+            if cur is not None:
+                self.broadcast({"ev": "end", "sid": sess.sid, "seq": cur.seq})
+        self.emit_sessions()
 
     def cmd_stop(self, sid=None):
         """Silence a whole session: kill its player and drop its queue + backlog."""
@@ -1279,8 +1400,8 @@ class Daemon:
                 self._safe_remove(sess.cur.path)
             sess.cur = None
             sess.paused = False
-            sess.inflight = 0
-            sess.playing_msg_id = None
+            sess.inflight.clear()
+            sess.msg_id = None
             if self.active_sid == sess.sid:
                 self.active_sid = None
             self._set_state(sess, "ended" if sess.can_replay() else "idle")
@@ -1302,8 +1423,8 @@ class Daemon:
             sess.proc = None
             sess.player_paused = False
             sess.paused = False
-            sess.inflight = 0
-            sess.playing_msg_id = None
+            sess.inflight.clear()
+            sess.msg_id = None
             sess.disabled = True
             if self.active_sid == sess.sid:
                 self.active_sid = None
@@ -1345,8 +1466,8 @@ class Daemon:
                 sess.proc = None
                 sess.player_paused = False
                 sess.paused = False
-                sess.inflight = 0
-                sess.playing_msg_id = None
+                sess.inflight.clear()
+                sess.msg_id = None
                 if self.muted_all:
                     sess.disabled = True
                 sess.state = ("disabled" if sess.disabled
@@ -1369,52 +1490,56 @@ class Daemon:
                     sess.state = "ended" if sess.can_replay() else "idle"
         self.emit_sessions()
 
-    def cmd_repeat(self, sid=None):
-        """Replay the current paragraph from its start, then continue forward."""
-        self._seek(sid, lambda sess: sess.cur_idx)
-
-    def cmd_prev(self, sid=None):
-        """Step back exactly one paragraph, then continue forward from there."""
-        self._seek(sid, lambda sess: sess.cur_idx - 1)
-
     def cmd_restart(self, sid=None):
-        """Re-speak the whole current message from the beginning."""
-        self._seek(sid, lambda sess: 0)
+        """Drop everything a session is saying or has waiting, and speak its newest message from the top."""
+        with self.play_lock:
+            sess = self._resolve(sid, prefer_active=False)
+            if not sess or sess.newest is None:
+                return
+            self.cmd_stop(sess.sid)
+            sess.msg = sess.newest
+            self._take_speaker(sess)
+            self._set_state(sess, "playing")
+            sess.msg_id = "_nav_%d" % (self.seq_counter + 1)
+            self._enqueue_chunks(sess, sess.msg_id, sess.msg, 0, first=True)
+            self.broadcast(self._current_event(sess, 0))
 
     def cmd_seek(self, sid=None, idx=0):
         """Speak the current message from the chosen paragraph (the UI clicks one)."""
-        self._seek(sid, lambda sess: idx)
+        self._seek(sid, idx)
 
-    def _seek(self, sid, pick_idx):
-        """Re-queue a session's current message starting at the chosen paragraph."""
+    def _seek(self, sid, idx):
+        """Speak a session's current message again from paragraph idx, before the messages waiting after it."""
         with self.play_lock:
             sess = self._resolve(sid, prefer_active=False)
-            if not sess or not sess.msg_chunks or not sess.played:
+            if not sess or not sess.can_replay():
                 return
-            target = max(0, min(pick_idx(sess), len(sess.msg_chunks) - 1))
-            chunks, full = sess.msg_chunks, sess.msg_full
-            self._clear_for_seek(sess)
-            sess.cur_idx = target       # so a follow-up Prev steps from the new spot
-            msg_id = "_nav_%d" % (self.seq_counter + 1)
-        self._enqueue_chunks(sess, msg_id, chunks, full, target)
+            idx = max(0, min(idx, len(sess.msg.chunks) - 1))
+            self._drop_current(sess)
+            sess.paused = False
+            self._take_speaker(sess)
+            self._set_state(sess, "playing")
+            #the re-queued paragraphs are the current message's now, so a further click or Skip drops them
+            sess.msg_id = "_nav_%d" % (self.seq_counter + 1)
+            self._enqueue_chunks(sess, sess.msg_id, sess.msg, idx, first=True)
 
-    def _clear_for_seek(self, sess):
-        """Tear down a session's current playback so it can be re-queued from a
-        chosen paragraph. Keeps msg_chunks/msg_full intact for navigation."""
-        sess.gen_token += 1                 # invalidate this session's in-flight synth
+    def _drop_current(self, sess):
+        """Silence a session's current message and drop the rest of it, keeping the messages waiting after it."""
+        msg_id = sess.msg_id
+        if msg_id is None:
+            return
+        self._mark_cancelled(msg_id)        #its chunk still rendering is dropped once done
+        for item in [x for x in sess.q if x.msg_id == msg_id]:
+            sess.q.remove(item)
+            self._safe_remove(item.path)
+        self.synth_chan.drop_where(lambda u: u.msg_id == msg_id)
+        sess.inflight = {u for u in sess.inflight if u.msg_id != msg_id}
         if sess.cur is not None:
-            self._mark_cancelled(sess.cur.msg_id)
+            self._kill(sess.proc)
             self._safe_remove(sess.cur.path)
-        self._drain_session(sess)
-        self._kill(sess.proc)
-        sess.cur = None
-        sess.proc = None
-        sess.player_paused = False
-        sess.paused = False
-        sess.inflight = 0
-        sess.playing_msg_id = None
-        self.active_sid = sess.sid
-        self._set_state(sess, "playing")
+            sess.cur = None
+            sess.proc = None
+            sess.player_paused = False
 
     def cmd_focus(self, sid):
         self.focus_sid = sid
@@ -1538,10 +1663,6 @@ class Daemon:
             self.cmd_disable(sid)
         elif cmd == "enable":
             self.cmd_enable(sid)
-        elif cmd == "repeat":
-            self.cmd_repeat(sid)
-        elif cmd in ("prev", "previous", "back"):
-            self.cmd_prev(sid)
         elif cmd == "restart":
             self.cmd_restart(sid)
         elif cmd == "seek":

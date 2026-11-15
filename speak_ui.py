@@ -43,7 +43,8 @@ HL_BG     = "#2f6d3c"     # word being spoken
 SPOKEN    = "#5b606a"     # words already spoken
 UNREAD    = "#454b56"     # paragraphs of the message still to come
 TRACK     = "#2c313a"     # slider groove
-WARN      = "#e3a33b"     # edge-tts is down, the local voice speaks instead
+WARN      = "#e3a33b"     #a render the voice waits on is slow or retrying
+ERROR     = "#f85149"     #the fallback voice speaks instead of edge-tts
 
 PILL_PADX = 12            # a pill's own left/right padding
 TAB_GAP   = 6             # space after a pill
@@ -247,7 +248,12 @@ class SpeakUI:
         # per-session read-along state
         self.view = {}                  # sid -> dict(text,words,spans,ranges,idx,hl,t0,…)
         self._rendered = None           # (sid,body,tag) currently in the text widget
-        self.stick = True               # follow the spoken word, until you scroll off it
+        self.stick = True               #follow the spoken word, until you scroll the card yourself
+        self._snap_shown = None         #arrow on the snap button, None while it's hidden
+
+        self.tts = None                 #last tts event: what the renderer is doing for each tab
+        self.tts_since = {}             #sid -> monotonic time the render that tab waits on began
+        self._tts_shown = None          #[(text, colour)] of each renderer status piece now
 
         self._fonts()
         self._set_icon()
@@ -311,17 +317,20 @@ class SpeakUI:
         self.status = tk.Label(self.statuswrap, text="connecting…", anchor=tk.W,
                                font=self.f_status, bg=BG, fg=MUTED, padx=12, pady=3)
         self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.tts_warn = tk.Label(self.statuswrap, font=self.f_status, bg=BG, fg=WARN,
-                                 padx=12, pady=3)
+        #ready count, next render, fallback voice: each coloured on its own
+        tts_bar = tk.Frame(self.statuswrap, bg=BG)
+        tts_bar.pack(side=tk.RIGHT, padx=12, before=self.status)
+        self.tts_parts = [tk.Label(tts_bar, font=self.f_status, bg=BG, bd=0, padx=0, pady=3)
+                          for _ in range(3)]
+        for part in self.tts_parts:
+            part.pack(side=tk.LEFT)
 
         # transport for the selected session
         bar = self.bar = tk.Frame(self.root, bg=BG)
         bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(6, 6))
-        self.b_prev    = self._tbtn(bar, "⏪ Previous", lambda: self._nav("prev"))
-        self.b_repeat  = self._tbtn(bar, "⏮ Repeat", lambda: self._nav("repeat"))
         self.b_play    = self._tbtn(bar, "⏸ Pause", self._toggle)
         self.b_skip    = self._tbtn(bar, "⏭ Skip", lambda: self.send("skip", self.selected))
-        self.b_restart = self._tbtn(bar, "↺ Restart", lambda: self._nav("restart"))
+        self.b_restart = self._tbtn(bar, "↺ Restart", self._restart)
         self.b_disable = self._tbtn(bar, "⊘ Disable", self._toggle_disable)
         # no trailing gap on the last one: its right edge is the row's, level with
         # the gear above it, and the window may shrink those pixels further
@@ -355,6 +364,11 @@ class SpeakUI:
             self.text.bind(seq, lambda e: "break")
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.text.bind(seq, self._on_text_scroll)
+        #created after the text, so it draws on top of it
+        self.snap = tk.Label(card, font=self.f_pill, bg=PILL_BG, fg=INK,
+                             padx=10, pady=4, cursor="hand2")
+        self._hover(self.snap, PILL_BG, PILL_HI)
+        self.snap.bind("<Button-1>", lambda e: self._snap())
 
         self._measure()                 # sizes must be read before propagation is off
         self.top.pack_propagate(False)
@@ -375,8 +389,7 @@ class SpeakUI:
         self._fit_strips(event.height)
 
     def _recaption(self):
-        for b in (self.b_prev, self.b_repeat, self.b_play, self.b_skip,
-                  self.b_restart, self.b_disable):
+        for b in (self.b_play, self.b_skip, self.b_restart, self.b_disable):
             b.configure(text=self._label(b._full))
         self._paint_stopall()
 
@@ -620,16 +633,10 @@ class SpeakUI:
     def _toggle(self):
         self.send(getattr(self.b_play, "_act", "resume"), self.selected)
 
-    def _nav(self, cmd):
-        """Paragraph navigation. The daemon has to re-synthesize audio (~1s), so we
-        move the reading card to the target paragraph right now — the text is correct
-        immediately and the voice catches up when the 'play' event lands."""
-        sid = self.selected
-        if not sid:
-            return
-        self.send(cmd, sid)
-        idx = (self.view.get(sid) or {}).get("idx", 0)
-        self._move_to(sid, {"repeat": idx, "prev": idx - 1, "restart": 0}[cmd])
+    def _restart(self):
+        """Drop what the selected session is saying or has waiting and speak its newest message from the top. The daemon's `current` event puts that message on the card."""
+        if self.selected:
+            self.send("restart", self.selected)
 
     def _move_to(self, sid, target):
         """Move the reading card to a paragraph, with no word spoken there yet."""
@@ -730,10 +737,14 @@ class SpeakUI:
             self.send("ping")
         elif kind == "_disconnected":
             self.status.config(text="daemon not running — retrying…")
+            self.tts = None
+            self._paint_tts()
         elif kind == "sessions":
             self._update_sessions(ev)
         elif kind == "play":
             self._on_play(ev)
+        elif kind == "current":
+            self._on_current(ev)
         elif kind == "end":
             self._on_end(ev)
         elif kind == "pause":
@@ -745,18 +756,11 @@ class SpeakUI:
             if self.setpanel is not None:
                 self.setpanel.set_config(self.config)
         elif kind == "tts":
-            if ev.get("wait"):
-                text = f"◷ edge-tts · {ev['wait']} s"
-                if ev.get("retry"):
-                    text += f" · retry {ev['retry']}/{ev['attempts']}"
-                self.tts_warn.config(text=text)
-                self.tts_warn.pack(side=tk.RIGHT, before=self.status)
-            elif ev.get("fallback"):
-                self.tts_warn.config(text="⚠ edge-tts failing, speaking with espeak · "
-                                          "journalctl --user -u claude-speak")
-                self.tts_warn.pack(side=tk.RIGHT, before=self.status)
-            else:
-                self.tts_warn.pack_forget()
+            self.tts = ev
+            now = time.monotonic()
+            self.tts_since = {sid: now - t["rendering"] for sid, t in ev["tabs"].items()
+                              if t["rendering"] is not None}
+            self._paint_tts()
         elif kind == "voices":
             self.voices = ev.get("voices") or []
             if self.setpanel is not None:
@@ -801,6 +805,19 @@ class SpeakUI:
             self._refresh_text()
         self._refresh_buttons()
 
+    def _on_current(self, ev):
+        """Show a session's message before it starts speaking: no word spoken yet, the paragraph it starts with lit."""
+        sid, chunks = ev["sid"], ev["chunks"]
+        body, ranges, idx = self._layout(chunks, ev["idx"], chunks[ev["idx"]])
+        self.view[sid] = {
+            "text": chunks[idx], "words": [], "spans": [], "t0": None,
+            "pause_accum": 0.0, "pause_started": None,
+            "body": body, "ranges": ranges, "idx": idx, "hl": -1,
+        }
+        if sid == self.selected:
+            self._refresh_text()
+        self._refresh_buttons()
+
     def _on_end(self, ev):
         sid = ev.get("sid")
         v = self.view.get(sid)
@@ -810,6 +827,7 @@ class SpeakUI:
             v["pause_started"] = None
         if sid == self.selected and v:
             self._repaint(v)
+            self._paint_snap()
 
     def _on_pause(self, sid):
         v = self.view.get(sid)
@@ -821,6 +839,34 @@ class SpeakUI:
         if v and v.get("pause_started") is not None:
             v["pause_accum"] += time.monotonic() - v["pause_started"]
             v["pause_started"] = None
+
+    def _paint_tts(self):
+        """Show what the renderer is doing for the open tab: how many of its paragraphs are ready, whether the next one is rendering and for how long or queued behind another tab's render, and the fallback voice if it speaks the current one."""
+        ev = self.tts
+        tab = ev["tabs"].get(self.selected) if ev else None
+        parts = [("", ACCENT)] * 3
+        if tab is not None and not tab["total"]:
+            parts[0] = ("ready", ACCENT)
+        elif tab is not None:
+            slow = False
+            if tab["next"] == "rendering":
+                took = time.monotonic() - self.tts_since[self.selected]
+                text = f"   rendering {took:.1f} s"
+                if ev["retry"]:
+                    text += f" · retry {ev['retry']}"
+                slow = bool(ev["retry"]) or took >= ev["slow"]
+                parts[1] = (text, WARN if slow else ACCENT)
+            elif tab["next"] == "queued":
+                parts[1] = ("   queued", ACCENT)
+            #nothing ready means the voice waits on that slow render too
+            parts[0] = (f"ready {tab['ready']}/{tab['total']}",
+                        WARN if slow and not tab["ready"] else ACCENT)
+            if tab["fallback"]:
+                parts[2] = (f"   fallback {tab['fallback']}", ERROR)
+        if parts != self._tts_shown:
+            self._tts_shown = parts
+            for label, (text, color) in zip(self.tts_parts, parts):
+                label.config(text=text, fg=color)
 
     # ─── reading card ───────────────────────────────────────────────────────────
 
@@ -855,7 +901,7 @@ class SpeakUI:
             s = self.sessions.get(self.selected, {})
             paused = ("— paused —" if s.get("has_work")
                       else "— paused. The next message will wait here. —")
-            body = {"ended": "— finished. Repeat to hear it again. —",
+            body = {"ended": "— finished. Restart to hear it again. —",
                     "paused": paused,
                     "disabled": "— disabled. Enable to hear this session again. —"}.get(
                         s.get("state"), "— waiting for output… —")
@@ -865,6 +911,7 @@ class SpeakUI:
         if key == self._rendered:
             if v:
                 self._repaint(v)        # same text, but the paragraph may have moved
+                self._paint_snap()
             return
         self._rendered = key
         self.stick = True               # a new message pulls the view back to it
@@ -876,6 +923,7 @@ class SpeakUI:
         w.config(state=tk.DISABLED)
         if tag is None and v:
             self._repaint(v)
+        self._paint_snap()
 
     def _refresh_buttons(self):
         s = self.sessions.get(self.selected, {}) if self.selected else {}
@@ -883,14 +931,11 @@ class SpeakUI:
         disabled = s.get("disabled", False)
         can_replay = s.get("can_replay", False)
         has_work = s.get("has_work", False)
-        active = state in ("playing", "paused")
 
         if disabled or not self.selected:
             # a disabled session is fully silenced; only Enable is actionable
             self._set_enabled(self.b_play, False, "▶ Play")
             self._set_enabled(self.b_skip, False, "⏭ Skip")
-            self._set_enabled(self.b_prev, False, "⏪ Previous")
-            self._set_enabled(self.b_repeat, False, "⏮ Repeat")
             self._set_enabled(self.b_restart, False, "↺ Restart")
             self._set_enabled(self.b_disable, bool(self.selected), "✓ Enable" if disabled
                               else "⊘ Disable")
@@ -908,9 +953,7 @@ class SpeakUI:
             self._set_enabled(self.b_play, True, "▶ Play")
             self.b_play._act = "resume"
 
-        self._set_enabled(self.b_skip, active, "⏭ Skip")
-        self._set_enabled(self.b_prev, can_replay, "⏪ Previous")
-        self._set_enabled(self.b_repeat, can_replay, "⏮ Repeat")
+        self._set_enabled(self.b_skip, has_work, "⏭ Skip")
         self._set_enabled(self.b_restart, can_replay, "↺ Restart")
         self._set_enabled(self.b_disable, True, "⊘ Disable")
 
@@ -923,6 +966,7 @@ class SpeakUI:
                 and s.get("state") == "playing":
             elapsed = (time.monotonic() - v["t0"] - v["pause_accum"]) * 1000.0
             self._apply_highlight(v, elapsed)
+        self._paint_tts()               #the render time counts up while it runs
         self.root.after(33, self._tick)
 
     def _apply_highlight(self, v, elapsed):
@@ -936,6 +980,7 @@ class SpeakUI:
             return
         v["hl"] = active
         self._repaint(v, scroll=True)
+        self._paint_snap()              #reading on moves the spoken word relative to a still card
 
     def _repaint(self, v, scroll=False):
         """Paint the current paragraph and v's remembered word position. Safe to call
@@ -970,13 +1015,42 @@ class SpeakUI:
             end = f"1.0+{base + spans[i][1]}c"
             w.tag_add("spoken", f"1.0+{base}c", start)
             w.tag_add("hl", start, end)
-            # only chase the word when it is actually off screen: a see() that cannot
-            # reach its index scrolls to the end, and re-issuing it loops forever
-            if scroll and self.stick and w.compare(start, "<", "end-1c") \
-                    and not w.bbox(start):
-                w.see(start)
+            if scroll and self.stick:
+                self._follow(v)
         except tk.TclError:
             pass
+
+    def _follow(self, v):
+        """Scroll the card so v's spoken text sits where following keeps it."""
+        w = self.text
+        start = self._get_spoken_range(v)[0]
+        if not w.compare(start, "<", "end-1c"):
+            return                      #see() can't reach it and would scroll to the end
+        off = self._follow_offset(v)
+        if off is None:
+            w.see(start)                #the offset is only measured on screen
+            off = self._follow_offset(v)
+        if off:
+            w.yview_scroll(int(off), "pixels")
+
+    def _follow_offset(self, v):
+        """Pixels to scroll the card by to put v's spoken text in its middle. None while that text starts off screen, 0 when the card is already there or can't get closer."""
+        w = self.text
+        start, end = self._get_spoken_range(v)
+        info = w.dlineinfo(start)
+        if info is None:
+            return None
+        line = self.f_read.metrics("linespace")
+        height = int(w.tk.call(str(w), "count", "-update", "-ypixels", start, end)) + line
+        pad = int(w.cget("pady"))
+        if height > w.winfo_height() - 2 * pad:
+            off = info[1] - pad         #taller than the card: its top at the card's top
+        else:
+            off = info[1] + height / 2 - w.winfo_height() / 2
+        first, last = w.yview()
+        if abs(off) <= line / 2 or (off > 0 and last >= 1.0) or (off < 0 and first <= 0.0):
+            return 0
+        return off
 
     # ─── click a paragraph to speak from there ─────────────────────────────────
 
@@ -1008,26 +1082,55 @@ class SpeakUI:
         self.text.config(cursor="hand2" if clickable else "arrow")
 
     def _on_text_scroll(self, _ev):
-        """Scrolling hands the view to you: auto-scroll stops while the spoken word is
-        off screen, and picks up again once you scroll back onto it."""
-        self.root.after_idle(self._check_stick)
+        """Scrolling hands the view to you: the card stops following the spoken word until the snap button is clicked."""
+        before = self.text.yview()
+        self.root.after_idle(lambda: self._on_scrolled(before))
 
-    def _check_stick(self):
+    def _on_scrolled(self, before):
+        if self.text.yview() != before:     #a wheel turn that moved nothing, as on a message that fits, keeps following
+            self.stick = False
+        self._paint_snap()
+
+    def _snap(self):
+        """Bring the spoken text back to the middle of the card and follow it again."""
+        self.stick = True
         v = self.view.get(self.selected)
-        ranges = (v or {}).get("ranges")
-        if not ranges:
-            self.stick = True
+        if v and v.get("ranges"):
+            self._follow(v)
+        self._paint_snap()
+
+    def _paint_snap(self):
+        """Show the snap button while the card isn't following and snapping would move it, its arrow pointing towards the spoken text."""
+        v = self.view.get(self.selected)
+        arrow = None
+        if not self.stick and v and v.get("ranges"):
+            off = self._follow_offset(v)
+            if off is None:
+                above = self.text.compare(self._get_spoken_range(v)[0], "<", "@0,0")
+                arrow = "↑" if above else "↓"
+            elif off:
+                arrow = "↑" if off < 0 else "↓"
+        if arrow == self._snap_shown:
             return
-        idx = min(v.get("idx", 0), len(ranges) - 1)
+        self._snap_shown = arrow
+        if arrow is None:
+            self.snap.place_forget()
+        else:
+            self.snap.configure(text=arrow)
+            self.snap.place(relx=1.0, rely=1.0, x=-12, y=-10, anchor=tk.SE)
+
+    def _get_spoken_range(self, v):
+        """Start and end text index of what v is speaking: the highlighted word, or the whole paragraph before its first word and after its last."""
+        ranges = v["ranges"]
+        a, b = ranges[min(v.get("idx", 0), len(ranges) - 1)]
         spans = v.get("spans") or []
         i = v.get("hl", -1)
-        off = ranges[idx][0]
-        if 0 <= i < len(spans) and spans[i]:
-            off += spans[i][0]
-        try:
-            self.stick = self.text.bbox(f"1.0+{off}c") is not None
-        except tk.TclError:
-            self.stick = True
+        if i < len(spans):
+            while i >= 0 and not spans[i]:     #unmapped token: the last mapped one, as the highlight does
+                i -= 1
+            if i >= 0:
+                a = b = a + spans[i][0]
+        return f"1.0+{a}c", f"1.0+{b}c"
 
     @staticmethod
     def _map_spans(text, words):

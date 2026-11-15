@@ -19,7 +19,7 @@ Each gets a Windows branch next to the Linux one.
 - CLAUDE.md: Linux and Windows instead of "Ubuntu only", and the Windows seams under Platform seams.
 
 ## Test on Windows
-- Pause, skip, repeat, tab switching and read-along behave as on Linux.
+- Pause, skip, restart, tab switching and read-along behave as on Linux.
 - A second daemon start exits and leaves the first one running.
 - The clipboard hotkey speaks the selection.
 - The daemon is up after login.

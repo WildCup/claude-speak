@@ -3,10 +3,9 @@
 speak_ctl: send a one-shot command to the running speak_daemon over its socket.
 
 Bind to keyboard shortcuts, e.g.:
-    .venv/bin/python speak_ctl.py stop      # silence rest of current message
+    .venv/bin/python speak_ctl.py stop      # silence the session: drop everything it has queued
     .venv/bin/python speak_ctl.py toggle    # pause / resume
-    .venv/bin/python speak_ctl.py repeat     # re-read last paragraph
-    .venv/bin/python speak_ctl.py skip       # jump to next chunk
+    .venv/bin/python speak_ctl.py skip       # drop the rest of the message
     .venv/bin/python speak_ctl.py stop_all   # silence everything until undone
     .venv/bin/python speak_ctl.py unmute_all # undo it
 
@@ -21,7 +20,7 @@ import socket
 SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".claude", "claude-speak.sock")
 
 VALID = {"pause", "resume", "toggle", "skip", "stop", "stop_all", "unmute_all",
-         "repeat", "back", "mute", "unmute", "focus", "ping"}
+         "focus", "ping"}
 
 
 def main():

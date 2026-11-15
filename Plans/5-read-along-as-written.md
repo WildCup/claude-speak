@@ -25,4 +25,4 @@ Pick a transcript message with a table, a list, bold text, inline code, a headin
 ## Test
 - Code blocks, paths, lists, tables and bold text look as in the terminal.
 - The highlight follows the voice through paths, `snake_case` names, `→` arrows and numbered lists.
-- Clicking a paragraph seeks to it. Previous / Next / Repeat land on the right paragraph.
+- Clicking a paragraph seeks to it. Restart lands on the first paragraph.

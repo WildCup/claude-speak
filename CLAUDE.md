@@ -8,7 +8,7 @@ Personal fork, one user, Ubuntu only. Not a product — no setup wizards, no cro
 
 ## The UI is the only control surface
 
-Voice, speed, volume, which session talks, pause/skip/repeat: all of it goes through `speak_ui.py` and the control socket.
+Voice, speed, volume, which session talks, pause/skip/restart: all of it goes through `speak_ui.py` and the control socket.
 A new setting belongs in the settings panel and `~/.claude/claude-speak.json`, reached over the socket. Not a marker file, not an env var, not a web page, not a Claude skill.
 
 The voice in `claude-speak.json` is used for every session and for the clipboard hotkey. There is deliberately no per-project or per-session override.
@@ -36,14 +36,14 @@ One speaker, many sessions: only one session is audible at a time, each has its 
 `speak_daemon.py`'s module docstring has the full playback model — read it before touching the scheduler.
 
 Clients talk to `~/.claude/claude-speak.sock`, one JSON object per line.
-The daemon pushes `sessions`, `config` and `tts` to every client on connect, and broadcasts `play` / `end` / `pause` / `resume` as playback moves, and `tts` while the speaker waits on a slow edge-tts render, and when edge-tts retries, falls back to espeak or recovers.
+The daemon pushes `sessions`, `config` and `tts` to every client on connect, and broadcasts `current` when a tab turns to its next message, `play` / `end` / `pause` / `resume` as playback moves, and `tts` when a tab's render status changes (how many paragraphs are ready, whether the next is rendering or queued, whether the fallback voice speaks), and when edge-tts retries or recovers.
 
 ## Traps
 
 - **The daemon runs under systemd.** `systemctl --user restart claude-speak` after editing `speak_daemon.py` or `speak_engine.py`, or the change isn't live. Restart it as part of making the change, without being asked.
 - **mpv is required for clean pausing.** It's paused over a JSON IPC socket so it corks its audio stream. The `ffplay` path pauses with SIGSTOP, which leaves the sink underrunning and whining, and its volume is fixed at spawn.
 - **Only one daemon may run.** `_daemon_is_live()` probes the socket before startup because `_socket_server` unlinks the socket before binding — a second instance would steal it and leave two watchers on the same logs.
-- **edge-tts is a network call.** `_render` retries, then falls back to local `espeak-ng`; a silently dropped message is the worst failure mode here.
+- **edge-tts is a network call.** `_render` retries until the voice waits on the paragraph, then falls back to local `espeak-ng`; a silently dropped message is the worst failure mode here.
 - **Tk's Listbox and Text fight you.** Their class bindings turn a held button into drag-selection plus an auto-scroll loop that only `<ButtonRelease-1>` cancels, and a window resize can strand that loop running forever. The voice list and the reading card bind `<B1-Motion>` and `<B1-Leave>` to `"break"` to keep them click-only.
 - **The daemon echoes a `config` event after every change.** UI code reacting to it must not rebuild or re-scroll the voice list, or the view jumps under the pointer while picking a voice.
 

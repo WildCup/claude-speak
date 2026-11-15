@@ -66,9 +66,8 @@ Each active Claude Code session gets a tab. The transport buttons act on the sel
 | Button | Effect |
 |---|---|
 | Pause / Resume | Hold this session; the speaker stays reserved for it |
-| Skip | Jump to the next paragraph |
-| Previous / Repeat | Re-read the previous or current paragraph |
-| Restart | Re-read the message from the top |
+| Skip | Drop the rest of this message and go on to the next |
+| Restart | Drop what's queued and read the newest message from the top |
 | Disable | Silence this session until you enable it again |
 | Stop all | Silence everything until undone |
 
@@ -85,8 +84,7 @@ Whatever is set here is used for every session.
 
 ```bash
 .venv/bin/python speak_ctl.py toggle      # pause / resume
-.venv/bin/python speak_ctl.py skip        # next paragraph
-.venv/bin/python speak_ctl.py repeat      # re-read current paragraph
+.venv/bin/python speak_ctl.py skip        # drop the rest of the message
 .venv/bin/python speak_ctl.py stop_all    # silence everything until undone
 .venv/bin/python speak_ctl.py unmute_all  # undo it
 ```
